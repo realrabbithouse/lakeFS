@@ -2,7 +2,7 @@
 
 ## Status
 
-**Draft** — Ready for review
+**Draft** — Under revision (storage layer + KV schema + lifecycle clarifications)
 
 ## Background
 
@@ -32,8 +32,8 @@ Uploading or downloading many small objects in lakeFS is inefficient because eac
 │   Compression Algorithm: uint8 (1 byte)                 │
 │     0 = none, 1 = zstd, 2 = gzip, 3 = lz4             │
 │   Classification: uint8 (1 byte)                        │
-│     0x01 = First-class (client-uploaded, never deleted during merge)│
-│     0x02 = Second-class (merged, eligible for GC)       │
+│     0x01 = First-class (COMMITTED, never deleted during merge)│
+│     0x02 = Second-class (STAGED or merged, eligible for GC)│
 │   Object Count: uint64 (8 bytes)                         │
 │   Total Size (uncompressed): uint64 (8 bytes)          │
 │   Total Size (compressed): uint64 (8 bytes)            │
@@ -45,6 +45,12 @@ Uploading or downloading many small objects in lakeFS is inefficient because eac
 │     Compressed Size: uint32 (4 bytes)                  │
 │     Content Hash: 32 bytes (SHA-256 of raw object)    │
 │     Compressed Data                                    │
+│                                                         │
+│ **Note:** `content_type` is NOT stored in the packfile  │
+│ binary format. Per-object metadata (content_type,       │
+│ user metadata) lives in the manifest and flows into     │
+│ the staging entry, not the packfile itself. The         │
+│ packfile is content-agnostic binary data.              │
 ├─────────────────────────────────────────────────────────┤
 │ Checksum (32 bytes) — SHA-256 of all above             │
 └─────────────────────────────────────────────────────────┘
@@ -55,7 +61,8 @@ Uploading or downloading many small objects in lakeFS is inefficient because eac
 - "Append-only" means objects are written sequentially during creation — no seeking back
 - All random access metadata lives in the separate index file (.sst)
 - Checksum covers header + all object data (each object's content hash is embedded in the data region for fast index building)
-- **Classification**: First-class packfiles are created by client upload and are protected from deletion during merge operations. Second-class packfiles are created by merge and are eligible for GC when new merged packfile is built
+- **Classification**: First-class (0x01) packfiles are COMMITTED and protected from deletion during merge. Second-class (0x02) packfiles are STAGED or merged, eligible for GC when new packfile is built
+- **Packfile ID** is the bare hex SHA-256 content hash of the packfile (no algorithm prefix). Client knows the packfile ID before uploading, enabling deduplication
 - New objects cannot be appended to an existing packfile; instead, create a new packfile and merge later
 
 ### 1.2 Index File (`.sst`)
@@ -135,9 +142,9 @@ SSTable (Sorted String Table) is already used by lakeFS's Graveler for range and
 <storage_namespace>/
 └── _packfiles/
     └── <repository_id>/
-        └── <pack_id>/
-            ├── data.pack     # binary data
-            └── data.sst     # index file
+        └── <packfile_id>/        # packfile_id = bare hex SHA-256
+            ├── data.pack          # binary data
+            └── data.sst          # index file
 ```
 
 **Temporary staging during upload:**
@@ -146,9 +153,11 @@ SSTable (Sorted String Table) is already used by lakeFS's Graveler for range and
 └── _packfiles/
     └── <repository_id>/
         └── tmp/
-            └── <upload_id>/
-                └── data.pack  # partial upload, streaming here
+            └── <upload_id>/       # upload_id = ULID, session token
+                └── data.pack     # partial upload, streaming here
 ```
+
+**Constraint:** The `_packfiles/` tree (both tmp/ and final packfile directories) must reside on the same filesystem/mount for atomic rename to work correctly. For NFS deployments, the entire `_packfiles/` tree must be one NFS mount.
 
 ### 1.4 Address Encoding
 
@@ -176,7 +185,7 @@ message Entry {
 PhysicalAddress = "data/objects/repo/..." (relative path)
 
 # Packfile objects (new):
-PhysicalAddress = "packfile:<pack_id>"
+PhysicalAddress = "packfile:<packfile_id>"   # packfile_id = bare hex SHA-256
 Offset = packfile_offset field
 ```
 
@@ -185,7 +194,7 @@ Offset = packfile_offset field
 type DBEntry struct {
     CommonLevel     bool
     Path            string
-    PhysicalAddress string   // "packfile:<pack_id>" for packfile entries
+    PhysicalAddress string   // "packfile:<packfile_id>" (bare hex SHA-256)
     CreationDate    time.Time
     Size            int64
     Checksum        string   // content hash (stored as hex string for compatibility)
@@ -201,12 +210,19 @@ type DBEntry struct {
 **ContentHash typed type** (new type in `pkg/packfile/`):
 
 ```go
-// ContentHash represents a SHA-256 content hash
+// ContentHash represents a SHA-256 content hash.
+// For packfiles, the ContentHash IS the packfile_id (content-addressed).
 type ContentHash [32]byte
+
+// PackfileID returns the content hash as a bare hex string (no prefix).
+// This value IS the packfile_id used in storage paths and KV keys.
+func (h ContentHash) PackfileID() string {
+    return fmt.Sprintf("%x", h[:])
+}
 
 // String returns the content hash as lowercase hex string (no prefix)
 func (h ContentHash) String() string {
-    return fmt.Sprintf("%x", h[:])
+    return h.PackfileID()
 }
 
 // ParseContentHash parses a content hash string.
@@ -230,6 +246,7 @@ func (h ContentHash) Equal(other ContentHash) bool {
 - Compile-time type safety prevents accidentally passing `[32]byte` where `ContentHash` expected
 - Methods like `String()` and `Parse()` handle hex encoding (no "sha256:" prefix)
 - Clear semantic intent: this is a content address, not just arbitrary bytes
+- `PackfileID()` makes the content-addressed identity explicit
 
 **Staging manager integration:**
 
@@ -280,23 +297,27 @@ The `graveler.Value` wraps the serialized `Entry` proto. When reading a staged e
 ```
 
 **Steps:**
-1. Server receives POST, validates packfile_info (size, checksum, compression)
+1. Server receives POST, validates packfile_info (size, checksum, compression). Creates an upload session entry in kv (status=in-progress). `upload_id` is a ULID.
 2. Client uploads manifest via `PUT manifest_url` (separate call)
-3. Client uploads packfile data via `PUT packfile_url` (streaming to local disk)
+3. Client uploads packfile data via `PUT packfile_url` (streaming to local disk at tmp/ path)
 4. As packfile data arrives, server reads each object's embedded hash, and writes an SSTable index entry; if `validate_object_checksum` is `true`, also compares the computed hash of each object's raw data against the embedded hash in the packfile data region (data integrity check)
-5. Background goroutine asynchronously copies packfile + index to S3 using block adapter's `Put` API
-6. On S3 confirm (if `force_sync_s3` is `true`, wait for both packfile and index before proceeding), packfile is marked "durable"
-7. On `/complete`: server validates manifest entries against the in-memory index (which now contains all content hashes from the packfile); if `validate_object_checksum` was `true` and any hash mismatch was detected during streaming, the upload is rejected
+5. Background goroutine asynchronously copies packfile + index to S3 using block adapter's `Put` API. This is independent of commit — replication happens at any time after the tmp/ → final location rename.
+6. On `/complete`: server validates manifest entries against the in-memory index (which now contains all content hashes from the packfile); if `validate_object_checksum` was `true` and any hash mismatch was detected during streaming, the upload is rejected. On success, the upload session in kv is marked completed, and the packfile metadata in kv transitions to STAGED.
 
 **Checksum mismatch during streaming:**
 - If `validate_object_checksum: true` and a mismatch is detected, the server immediately stops accepting data
 - tmp/ files (partial packfile data + partial index) are deleted before returning the error to the client
 - The rejection is atomic — no stale tmp files remain
 
+**Upload session cleanup:**
+- The upload session lives in kv with status=in-progress
+- On explicit `DELETE .../pack/{upload_id}`: tmp/ files are deleted and kv session is removed
+- On client disconnect without DELETE: kv session eventually expires (background process scans for expired sessions), triggering tmp/ cleanup
+
 **Why this approach:**
 - All data flows through server → enables validation
 - Local disk is always in sync for merge operations
-- S3 provides durability with async replication
+- S3 provides durability with async replication, decoupled from commit
 - Block adapter's simple `Put` API handles S3 writes (no multipart complexity needed for packfiles)
 - Index is generated server-side as packfile streams in, no second pass needed
 
@@ -320,7 +341,7 @@ Response: {
 }
 ```
 
-**Always validated:** `packfile_info.size`, `packfile_info.checksum`, `object_count` (against manifest metadata line)
+**Always validated:** `packfile_info.size`, `packfile_info.checksum`, `object_count` (against manifest metadata line), manifest `packfile_checksum` (must match `packfile_info.checksum` from init request).
 **Conditionally validated (when `validate_object_checksum: true`):** as each object arrives, server reads the raw object data, computes its content hash, and compares against the **embedded** content hash in the packfile data region. This verifies the packfile data was not corrupted in transit. Mismatch → upload rejected. When `false`, embedded hashes are still read to build the index, but no data integrity check is performed. The manifest entry checksum is used only for deduplication via `POST /resolve`, not for data integrity validation.
 
 # Upload packfile (streaming)
@@ -333,9 +354,7 @@ Body: JSON manifest
 
 # Complete import
 POST /repositories/{repository}/objects/pack/{upload_id}/complete
-Request: {
-    force_sync_s3: boolean   // default: false
-}
+Request: {}   // empty body
 Response: { staged_entries: [...] }
 
 # Abort upload
@@ -420,14 +439,9 @@ Content-Type: application/x-ndjson
 POST /repositories/{repository}/objects/pack/{upload_id}/complete
 ```
 
-**Request:**
-```json
-{
-  "force_sync_s3": true
-}
-```
+**Request:** `{}` (empty body)
 
-If `force_sync_s3` is `true`, the server waits for both the packfile **and** its index (`.sst`) to be fully synced to S3 before creating staging entries. This prevents data loss if the local disk fails. If `false`, the background goroutine copies asynchronously and staging entries are created immediately after local commit.
+On success, the upload session kv entry transitions to completed, packfile metadata transitions to STAGED, and staging entries are created. Commit is independent of S3 replication — the background goroutine replicates to S3 at any time after the tmp/ → final location rename.
 
 **Response (200 OK):**
 ```json
@@ -440,11 +454,11 @@ If `force_sync_s3` is `true`, the server waits for both the packfile **and** its
       "content_type": "image/png",
       "metadata": { "user-key": "user-value" },
       "address_type": "PACKFILE",
-      "physical_address": "packfile:pf-001",
+      "physical_address": "packfile:a3f2b1c9d4e5f6789012345678901234567890abcdef1234567890abcdef123456",
       "packfile_offset": 4096
     }
   ],
-  "packfile_id": "pf-001",
+  "packfile_id": "a3f2b1c9d4e5f6789012345678901234567890abcdef1234567890abcdef123456",
   "object_count": 100
 }
 ```
@@ -490,7 +504,7 @@ POST /repositories/{repository}/objects/pack/merge
 **Request:**
 ```json
 {
-  "packfile_ids": ["pf-001", "pf-002"],
+  "packfile_ids": ["a3f2b1c9d4e5f6789012345678901234567890abcdef1234567890abcdef123456", "b4e3d2c1a5f6e7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e"],
   "strategy": "auto"
 }
 ```
@@ -498,7 +512,7 @@ POST /repositories/{repository}/objects/pack/merge
 **Response (200 OK):**
 ```json
 {
-  "new_packfile_id": "pf-003",
+  "new_packfile_id": "c5f4d3b2a6e7f8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
   "merged_count": 2,
   "total_objects": 500
 }
@@ -513,19 +527,19 @@ GET /repositories/{repository}/objects/pack/{packfile_id}
 **Response (200 OK):**
 ```json
 {
-  "packfile_id": "pf-001",
+  "packfile_id": "a3f2b1c9d4e5f6789012345678901234567890abcdef1234567890abcdef123456",
   "object_count": 100,
   "size_bytes": 1048576,
   "compression": "zstd",
   "created_at": "2026-04-16T10:30:00Z",
-  "status": "active"
+  "status": "COMMITTED"
 }
 ```
 
 #### List Packfiles
 
 ```
-GET /repositories/{repository}/objects/pack?after=pf-001&limit=50
+GET /repositories/{repository}/objects/pack?after=<packfile_id>&limit=50
 ```
 
 **Response (200 OK):**
@@ -533,7 +547,7 @@ GET /repositories/{repository}/objects/pack?after=pf-001&limit=50
 {
   "packfiles": [
     {
-      "packfile_id": "pf-002",
+      "packfile_id": "b4e3d2c1a5f6e7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e",
       "object_count": 150,
       "size_bytes": 2097152,
       "created_at": "2026-04-16T11:00:00Z"
@@ -541,7 +555,7 @@ GET /repositories/{repository}/objects/pack?after=pf-001&limit=50
   ],
   "pagination": {
     "has_more": true,
-    "next_offset": "pf-003"
+    "next_offset": "<packfile_id>"
   }
 }
 ```
@@ -596,26 +610,27 @@ Given a content hash, find an object in a packfile using the SSTable index:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ L1: In-Memory LRU Cache                                 │
+│ L1: In-Memory SSTable Reader Cache                      │
 │   Capacity: configurable (default 1000 indices)         │
-│   Key: packfile_id                                      │
+│   Key: packfile_id (bare hex SHA-256)                  │
 │   Value: *sstable.Reader (open SSTable reader)        │
 │   TTL: none (evicted via LRU)                          │
 ├─────────────────────────────────────────────────────────┤
-│ L2: Local Disk                                          │
+│ L2: Local Disk / NFS — Primary Storage                  │
 │   Path: <storage_namespace>/_packfiles/<repo_id>/       │
-│   .sst SSTable files stored alongside .pack files      │
-│   Opened as sstable.Reader on first access             │
-│   Evicted when packfile deleted                        │
+│   .sst SSTable files and .pack data stored here        │
+│   Packfiles always written to and read from L2 first   │
+│   Merge operations read from L2 (not L3)               │
 ├─────────────────────────────────────────────────────────┤
-│ L3: Object Storage (S3/GCS/Azure)                       │
-│   Fetch .sst on L1+L2 miss                             │
-│   Cache to local disk, open as sstable.Reader          │
-│   Background refresh for frequently accessed          │
+│ L3: Object Storage (S3/GCS/Azure) — Async Replication   │
+│   Written by background goroutine after tmp→final move │
+│   Replication is decoupled from commit                 │
+│   Read path: L2 miss → L3 fetch → cache to L2         │
+│   Not the primary read target for merge                │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Note:** SSTable readers are relatively lightweight — they hold open file descriptors and block caches. LRU eviction closes the oldest reader.
+**Note:** L2 is primary storage, not a cache in the traditional sense. All writes go to L2 first. Reads prefer L2 but fall back to L3 on miss. L1 is the only true cache (in-memory SSTable reader LRU).
 
 #### LRU Cache Implementation
 
@@ -655,12 +670,12 @@ func (c *IndexCache) Put(packfileID string, r *sstable.Reader) {
 // Demo purpose
 func ReadObject(packfileID string, contentHash ContentHash) (io.Reader, error) {
     // 1. Check L1 cache
-    reader, ok := indexCache.Get(packfileID)
+    reader, ok := indexCache.Get(packfileID)  // packfileID = bare hex SHA-256
     if !ok {
-        // 2. Open SSTable from local disk
+        // 2. Open SSTable from L2 (local disk/NFS)
         f, err := os.Open(localPath(packfileID) + ".sst")
         if err != nil {
-            // 3. Fetch from S3
+            // 3. Fetch from L3 (S3), cache to L2, then open
             reader, err = openSSTableFromS3(packfileID)
             if err != nil {
                 return nil, err
@@ -685,7 +700,7 @@ func ReadObject(packfileID string, contentHash ContentHash) (io.Reader, error) {
         return nil, ErrObjectNotFound
     }
 
-    // 6. Range read from packfile
+    // 6. Range read from packfile data (L2 or L3 via blockAdapter.GetRange)
     data, err := blockAdapter.GetRange(
         ObjectPointer{Identifier: packfilePath(packfileID)},
         entry.Offset,
@@ -714,9 +729,16 @@ func ReadObject(packfileID string, contentHash ContentHash) (io.Reader, error) {
 
 The index file is built as an SSTable using `github.com/cockroachdb/pebble/sstable`. SSTable requires keys to be **sorted** before writing — the writer does not sort. The build process has two approaches based on object count.
 
+**Index entry value encoding:**
+Each index entry's value is three varints:
+```
+[varint(offset)][varint(size_uncompressed)][varint(size_compressed)]
+```
+Typical entry: 3-15 bytes total. The SSTable writer handles block boundaries and compression automatically.
+
 **Key constraint:** SSTable writer must receive entries in sorted order by content hash. Objects in the packfile arrive in creation order, which is not sorted. Entries must be collected, sorted, then written.
 
-**Approach A — In-memory sort (object count < threshold, default 1M):**
+**Approach A — In-memory sort (object count < 1M):**
 
 ```
 // Phase 1: Collect entries as packfile streams in
@@ -738,14 +760,14 @@ for entry in entries:
 sstWriter.Close()
 ```
 
-**Approach B — External sort (object count >= threshold, e.g., 1M+):**
+**Approach B — External sort (object count >= 1M):**
 
 ```
 // Phase 1: Stream to temp file (unsorted binary records)
 tempFile = createTempFile()
 for each object in packfile:
     hash = computeContentHash(object.rawData)
-    writeBinaryRecord(tempFile, {hash, offset, sizes})  // 53 bytes per record
+    writeBinaryRecord(tempFile, {hash, offset, sizes})  // ~15-50 bytes per record (varint-encoded)
 
 // Phase 2: External sort — sort temp file runs, merge into sorted output
 sortedFile = externalMergeSort(tempFile)  // k-way merge, never loads all in memory
@@ -758,22 +780,193 @@ sstWriter.Close()
 ```
 
 **Memory usage:**
-- Approach A: O(n) where n = object count (~53MB per 1M objects for entry metadata)
+- Approach A: O(n) where n = object count (~15-50MB per 1M objects for entry metadata with varint encoding)
 - Approach B: O(BlockSize) for SSTable writer; external sort uses temp files
 
-**First-class packfile optimization:** For first-class packfiles (classification = 0x01), the manifest already contains all entry metadata. The server pre-allocates index entries from the manifest in creation order, then sorts and writes SSTable. The manifest entry count tells us when the full dataset is available for sorting. *Optimization:* Add "is_sorted" flag at the first line of manifest, it should directly build SSTable if entries in manifest are already sorted, the sort task is delegate to the client. This can significantly reduce server side complexity.
+**Manifest `is_sorted` flag:** The manifest first line may include `"is_sorted": true` if client guarantees entries are sorted by content hash. In this case, the server skips the sort phase and writes SSTable directly from the manifest. If `is_sorted` is false or omitted, the server sorts. If client claims `is_sorted: true` but entries are not actually sorted, SSTable build fails and the upload is rejected — the client is responsible for correctness.
 
 **Index building during merge:** Merge reads objects from the **source packfiles** and writes a new packfile. For each object read, the server computes the content hash and writes to a temp file (Approach B). After all objects are read, external sort produces sorted entries, then SSTable writer writes the index in sorted order.
 
-### 3.5 Prefetching
+## 4. Packfile Manager
 
-For sequential reads (e.g., listing objects), prefetch adjacent objects:
-- If client reads object at offset X, prefetch next 1MB chunk
-- Reduces round-trips for sequential access patterns
+### 4.1 Role
+
+**Packfile Manager** is the single authority for all packfile and packfile metadata operations. All state transitions and packfile lifecycle events go through Packfile Manager. Graveler is a client of the Packfile Manager API — it never directly manipulates packfile metadata.
+
+**Responsibilities:**
+- Manage packfile metadata in kv (create, read, update, delete)
+- Manage upload sessions in kv (create, complete, abort, expire)
+- Execute packfile merge (deduplication, new packfile creation, SSTable index building)
+- Transition packfile statuses (STAGED → COMMITTED, COMMITTED → SUPERSEDED, etc.)
+- Update PackfileSnapshot in kv atomically
+- Cleanup tmp/ files when upload sessions expire or are aborted
+
+**Packfile Manager API (operations it exposes):**
+
+| Operation | Description |
+|-----------|-------------|
+| `CreateUploadSession(repo_id)` | Create kv entry with upload_id (ULID), status=in-progress, tmp_path |
+| `CompleteUploadSession(upload_id)` | Mark session completed, create PackfileMetadata (STAGED, SECOND_CLASS) |
+| `AbortUploadSession(upload_id)` | Delete kv entry, cleanup tmp/ files |
+| `GetPackfile(packfile_id)` | Read PackfileMetadata from kv |
+| `ListPackfiles(repo_id)` | List all packfiles for repository (by status) |
+| `GetSnapshot(repo_id)` | Read PackfileSnapshot |
+| `MergeStaged(repo_id)` | Merge all STAGED packfiles → one STAGED packfile, delete raw STAGED files |
+| `Commit(repo_id)` | Transition merged STAGED → COMMITTED, update PackfileSnapshot |
+| `Merge(repo_id, packfile_ids)` | Merge packfiles → new COMMITTED packfile, mark sources SUPERSEDED |
+| `CleanupSuperseded()` | Scan for SUPERSEDED packfiles, delete data, transition to DELETED |
+
+### 4.2 Commit Flow Integration
+
+When Graveler performs a commit:
+
+```
+1. Graveler calls PackfileManager.MergeStaged(repo_id):
+   - Reads all STAGED packfiles from kv snapshot
+   - Deduplicates by content hash, writes one merged packfile
+   - Deletes raw STAGED packfile files
+   - Creates one STAGED packfile metadata (SECOND_CLASS)
+   - Updates PackfileSnapshot.staged_packfile_ids = [merged_staged_id]
+
+2. Graveler runs commit transaction:
+   - Creates new metarange referencing objects from the merged STAGED packfile
+   - Creates commit record
+
+3. Graveler calls PackfileManager.Commit(repo_id):
+   - Transition merged STAGED → COMMITTED, classification = FIRST_CLASS
+   - Update PackfileSnapshot: active_packfile_ids = [new_comitted_id], staged_packfile_ids = []
+```
+
+If step 2 fails, the merged STAGED packfile remains in kv (can be retried or cleaned up). Raw STAGED packfiles are already deleted.
+
+### 4.3 Merge Flow Integration
+
+```
+1. Graveler calls PackfileManager.Merge(repo_id, packfile_ids, strategy):
+   - Read all source packfile metadata (must be COMMITTED)
+   - Stream objects from source packfiles, deduplicate by content hash
+   - Write new merged packfile + SSTable index
+   - Create PackfileMetadata: status=COMMITTED, classification=SECOND_CLASS
+   - Update PackfileSnapshot: active_packfile_ids = [new_merged_id]
+   - Mark source packfiles: status=SUPERSEDED
+
+2. PackfileManager.CleanupSuperseded() (async, later):
+   - Deletes .pack and .sst files for SUPERSEDED packfiles
+   - Transitions status: SUPERSEDED → DELETED
+```
+
+### 4.4 Upload Session Cleanup
+
+Upload sessions in kv are scoped by TTL. A background goroutine periodically scans for expired sessions (status=in-progress, created_at < now - TTL). On expiry:
+1. Delete tmp/ files for the session
+2. Delete kv upload session entry
+
+This handles client disconnects without explicit DELETE — no separate tmp/ TTL needed.
 
 ---
 
-## 4. Packfile Merge
+## 5. KV Schema
+
+Packfile metadata uses a dedicated `packfiles` partition in kv. All packfile and upload session operations go through Packfile Manager.
+
+### 5.1 Partition
+
+```
+Partition: "packfiles"  (registered as a kv partition type)
+```
+
+### 5.2 Protobuf Structures
+
+```protobuf
+// pkg/packfile/packfile.proto
+
+enum PackfileStatus {
+  STAGED = 0;       // Created by upload, not yet committed
+  COMMITTED = 1;    // Part of a commit, first-class protection
+  SUPERSEDED = 2;   // Replaced by a merged packfile, eligible for GC
+  DELETED = 3;      // Data removed, metadata to be purged
+}
+
+enum PackfileClassification {
+  SECOND_CLASS = 0; // Default for STAGED and merged packfiles
+  FIRST_CLASS = 1;  // COMMITTED client-uploaded packfiles, never deleted during merge
+}
+
+message PackfileMetadata {
+  string packfile_id = 1;           // Bare hex SHA-256 — content-addressed identity
+  PackfileStatus status = 2;
+  PackfileClassification classification = 3;
+  string repository_id = 4;
+  string storage_namespace = 5;     // For constructing full path to packfile
+  int64 object_count = 6;
+  int64 size_bytes = 7;            // Uncompressed total size
+  int64 size_bytes_compressed = 8;
+  string compression_algorithm = 9; // "zstd" | "gzip" | "none"
+  string checksum_algorithm = 10;   // "sha256" | "blake3" | "xxhash"
+  google.protobuf.Timestamp created_at = 11;
+  repeated string source_packfile_ids = 12; // Only set for merged packfiles
+}
+
+// Snapshot of all active packfiles for a repository.
+// Updated atomically on commit and merge.
+message PackfileSnapshot {
+  string repository_id = 1;
+  repeated string active_packfile_ids = 2;   // COMMITTED packfiles containing the current committed object set
+  repeated string staged_packfile_ids = 3;   // STAGED packfiles created but not yet committed
+  google.protobuf.Timestamp last_commit_at = 4;
+  google.protobuf.Timestamp last_merge_at = 5;
+}
+
+// Upload session for tmp/ file lifecycle management.
+message UploadSession {
+  string upload_id = 1;              // ULID — session token
+  string packfile_id = 2;            // Bare hex SHA-256 of the packfile
+  string repository_id = 3;
+  string tmp_path = 4;               // Path to tmp/ staging directory
+  google.protobuf.Timestamp created_at = 5;
+  // status not stored separately — absence of record = abandoned
+}
+```
+
+### 5.3 Key Patterns
+
+| Key Pattern | Value Type | Description |
+|-------------|------------|-------------|
+| `packfile:{packfile_id}` | PackfileMetadata | Packfile metadata by ID |
+| `snapshot:{repository_id}` | PackfileSnapshot | Active + staged packfile IDs for a repository |
+| `upload:{upload_id}` | UploadSession | Upload session for tmp/ cleanup |
+
+### 5.4 Status Lifecycle
+
+```
+STAGED ──────────► COMMITTED  (on PackfileManager.Commit)
+   │                              │
+   │ (abandoned upload)           │ (PackfileManager.Merge)
+   ▼                              ▼
+ DELETED                     SUPERSEDED
+                                  │
+                                  ▼ (PackfileManager.CleanupSuperseded)
+                               DELETED
+```
+
+| Transition | Trigger | Actor |
+|------------|---------|-------|
+| STAGED → COMMITTED | Commit success | PackfileManager.Commit |
+| STAGED → DELETED | GC of abandoned uploads | PackfileManager.Cleanup |
+| COMMITTED → SUPERSEDED | Merge replaces sources | PackfileManager.Merge |
+| SUPERSEDED → DELETED | GC cleanup | PackfileManager.CleanupSuperseded |
+
+### 5.5 Classification Lifecycle
+
+| Status | Classification | Notes |
+|--------|---------------|-------|
+| STAGED | SECOND_CLASS | Default on upload |
+| COMMITTED | FIRST_CLASS | Promoted on commit for merged STAGED packfiles; client uploads are also FIRST_CLASS once committed |
+| COMMITTED | SECOND_CLASS | Possible if a COMMITTED packfile is explicitly merged as a source |
+| SUPERSEDED | (unchanged) | Inherits from COMMITTED |
+| DELETED | (unchanged) | Final state |
+
+
 
 ### 4.1 Trigger Conditions
 
@@ -975,7 +1168,7 @@ Packfile Lifecycle:
 
 ---
 
-## 5. Block Adapter Integration
+## 6. Block Adapter Integration
 
 ### 5.1 Dependencies
 
@@ -1031,7 +1224,7 @@ packfile:
 
 ---
 
-## 6. Configuration
+## 7. Configuration
 
 | Parameter | Default | Max | Description |
 |-----------|---------|-----|-------------|
@@ -1047,7 +1240,7 @@ packfile:
 
 ---
 
-## 7. Error Handling
+## 8. Error Handling
 
 | Scenario | Handling |
 |----------|----------|
@@ -1062,49 +1255,52 @@ packfile:
 
 ---
 
-## 8. Open Questions
+## 9. Open Questions
 
 | Question | Status | Notes |
 |----------|--------|-------|
 | Packfile download (server → client) | Deferred | Not in initial scope |
-| S3 Gateway integration | Deferred | Should packfile objects be S3-listable? |
+| S3 Gateway integration | Deferred | Packfile objects are not S3-listable; they are lakeFS-internal |
 | Metrics/monitoring | Deferred | Need visibility into packfile operations |
 | Packfile stats in UI | Deferred | |
 
 ---
 
-## 9. Implementation Plan
+## 10. Implementation Plan
 
 ### Phase 1: Core Packfile
 - [ ] Packfile binary format and writer (streaming)
-- [ ] Packfile reader with index lookup
-- [ ] Block adapter integration for storage
-- [ ] Basic upload API endpoints
+- [ ] Packfile reader with index lookup (SSTable + Bloom filter)
+- [ ] Block adapter integration for storage (local disk primary, S3 async backup)
+- [ ] Basic upload API endpoints (init, upload data, upload manifest, complete, abort)
+- [ ] Upload session management in kv
 
-### Phase 2: Integration
-- [ ] Staging manager integration
-- [ ] Manifest validation
-- [ ] DBEntry schema update
-- [ ] Commit flow changes
+### Phase 2: Packfile Manager + KV + Integration
+- [ ] KV schema: PackfileMetadata, PackfileSnapshot, UploadSession protos
+- [ ] Packfile Manager: all state transitions, snapshot updates
+- [ ] Manifest validation (checksum vs. init request)
+- [ ] DBEntry schema update (PACKFILE address type, packfile_offset)
+- [ ] Commit flow integration with Packfile Manager
 
-### Phase 3: Merge & GC
-- [ ] Packfile merge operation
-- [ ] Reference counting
-- [ ] Background GC
+### Phase 3: Merge & Cleanup
+- [ ] Packfile merge operation (deduplication, SSTable index, atomic rename)
+- [ ] COMMITTED → SUPERSEDED transitions
+- [ ] SUPERSEDED → DELETED cleanup
 
 ### Phase 4: Optimization
-- [ ] Index caching (LRU + memory-map)
-- [ ] Prefetching for sequential reads
+- [ ] Index caching (LRU + memory-mapped SSTable readers)
 - [ ] Async S3 replication
 
 ---
 
-## 10. Dependencies
+## 11. Dependencies
 
 | Package | Role |
 |---------|------|
+| `pkg/packfile/` | Packfile Manager, binary format, SSTable index building |
 | `pkg/block/` | Storage abstraction (unchanged) |
 | `pkg/api/` | REST API endpoints |
 | `pkg/graveler/staging/` | Staging manager integration |
+| `pkg/kv/` | Packfile metadata and upload session storage |
 | `pkg/catalog/` | DBEntry and metadata |
-| `pkg/graveler/` | Commit flow |
+| `pkg/graveler/` | Commit flow, calls Packfile Manager |
