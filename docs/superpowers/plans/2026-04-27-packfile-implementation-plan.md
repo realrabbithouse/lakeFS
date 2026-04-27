@@ -4,7 +4,7 @@
 
 **Goal:** Implement the packfile transfer protocol — a streaming binary bundle format for bulk object upload/download with content-addressable deduplication, SSTable indexing, and packfile merge.
 
-**Architecture:** Packfiles are immutable binary bundles of compressed objects stored on local disk/NFS (primary) with async S3 backup. An SSTable index provides O(1) bloom-filter-accelerated lookups by content hash. Packfile Manager is the single authority for all packfile metadata state; Graveler is its client.
+**Architecture:** Packfiles are immutable binary bundles of compressed objects stored on local disk/NFS (primary) with async S3 backup. An SSTable index provides O(1) bloom-filter-accelerated lookups by content hash. Packfile Manager is the single authority for all packfile metadata state; Graveler is its client. The packfile binary format uses Packer (append-only writer) and Unpacker (random+sequential access) abstractions with true streaming IO throughout.
 
 **Tech Stack:** Go, `github.com/cockroachdb/pebble/sstable`, `github.com/google/uuid`, block adapter (S3/GCS/Azure/Local)
 
@@ -20,17 +20,20 @@ pkg/packfile/
 ├── packfile.pb.go             # Generated protobuf
 ├── content_hash.go            # ContentHash typed type, bare hex SHA-256
 ├── format.go                 # Binary packfile format: magic, header, constants
-├── writer.go                 # Streaming packfile writer
-├── reader.go                 # Streaming packfile reader
-├── index_writer.go           # Streaming SSTable index writer (Approach A: in-memory sort)
-├── index_writer_ext.go       # External sort SSTable writer (Approach B: >= 1M objects)
+├── compress.go               # Streaming compression/uncompression (io.Pipe-based)
+├── packer.go                 # Packer interface + implementation (append-only packfile writer)
+├── packer_test.go
+├── unpacker.go               # Unpacker interface + implementation (packfile reader)
+├── unpacker_test.go
+├── index_writer.go           # SSTable index writer (Approach A: in-memory sort)
+├── index_writer_test.go
 ├── manager.go                # Packfile Manager: all state transitions
-├── kv.go                     # KV store helpers for packfile types
-└── packfile_test.go          # Unit tests for format, writer, reader
+├── manager_test.go
+└── kv.go                    # KV store helpers for packfile types
 
 pkg/api/
 ├── controller.go              # Add packfile API handlers
-└── apigen/                   # (generated from swagger.yml)
+└── apigen/                  # (generated from swagger.yml)
 
 pkg/graveler/
 └── packfile_manager.go       # Graveler's PackfileManager interface, delegates to pkg/packfile
@@ -38,15 +41,67 @@ pkg/graveler/
 pkg/catalog/
 └── model.go                  # Add PACKFILE AddressType, PackfileOffset field
 
-pkg/block/
-└── adapter.go                # (existing, no changes needed)
-
-cmd/
-└── lakefs/
-    └── serve.go              # Wire Packfile Manager into server
-
 config/
 └── config.go                 # Packfile config: thresholds, paths, cache sizes
+```
+
+---
+
+## Key Interfaces
+
+### Packer — Build Packfile
+
+```go
+// Packer builds a packfile. Append-only, Close() seeks back to update header.
+type Packer interface {
+    // AppendObject appends one object to the packfile.
+    // Compression happens streaming — no in-memory []byte for bulk data.
+    // Returns the content hash, the byte offset in the packfile (before compression),
+    // the compressed size, and the uncompressed size.
+    AppendObject(ctx context.Context, r io.Reader) (h ContentHash, offset int64, compressedSize, uncompressedSize int64, err error)
+    // Close updates the packfile header with final totals and writes the footer checksum.
+    // Close is idempotent and thread-unsafe (no concurrent AppendObject after Close).
+    Close() error
+}
+```
+
+### Unpacker — Read Packfile
+
+```go
+// Unpacker reads objects from a packfile. Supports both random access (by offset)
+// and sequential scan. Decompression is streaming — no in-memory []byte for bulk data.
+type Unpacker interface {
+    // GetObject returns a decompressed io.Reader for the object at the given offset.
+    // The caller must not retain the returned reader across operations.
+    GetObject(ctx context.Context, offset int64) (io.Reader, error)
+
+    // Scan returns an iterator over all objects in the packfile, in creation order.
+    // Sequential scan only — do not use for random access.
+    Scan(ctx context.Context) PackfileIterator
+}
+
+// PackfileIterator is returned by Unpacker.Scan.
+type PackfileIterator interface {
+    Next() bool
+    // Object returns the metadata for the current object.
+    // The returned io.ReadCloser provides the decompressed raw object data.
+    // It must be closed by the caller after reading.
+    Object() (offset int64, uncompressedSize int64, r io.ReadCloser, err error)
+    Err() error
+    Close() error
+}
+```
+
+### Streaming Compression Utilities
+
+```go
+// CompressTo writes compressed data to w, reading from r.
+// Compression algorithm is determined by c.
+func CompressTo(r io.Reader, c Compression, w io.Writer) error
+
+// UncompressTo writes uncompressed data to w, reading from r.
+// Compression algorithm is determined by c.
+func UncompressTo(r io.Reader, c Compression, w io.Writer) error
 ```
 
 ---
@@ -58,7 +113,7 @@ config/
 **Files:**
 - Create: `pkg/packfile/packfile.proto`
 - Create: `pkg/packfile/packfile.pb.go` (generated)
-- Modify: `pkg/kv/msg.go` (add MustRegisterType import)
+- Create: `pkg/packfile/kv.go`
 
 ```protobuf
 syntax = "proto3";
@@ -178,9 +233,7 @@ message UploadSession {
 Run: `cd pkg/packfile && go generate ./...`
 Expected: `packfile.pb.go` generated
 
-- [ ] **Step 3: Register packfile types in kv**
-
-Create `pkg/packfile/kv.go`:
+- [ ] **Step 3: Create `pkg/packfile/kv.go`**
 
 ```go
 package packfile
@@ -189,9 +242,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 )
 
-const (
-	PackfilesPartition = "packfiles"
-)
+const PackfilesPartition = "packfiles"
 
 func init() {
 	kv.MustRegisterType(PackfilesPartition, "packfile:*", (&PackfileMetadata{}).ProtoReflect().Type())
@@ -214,7 +265,7 @@ func UploadPath(uploadID string) string {
 
 - [ ] **Step 4: Run existing tests to verify kv registration doesn't break anything**
 
-Run: `go test ./pkg/kv/... -count=1 -v 2>&1 | tail -20`
+Run: `go test ./pkg/kv/... -count=1 2>&1 | tail -5`
 Expected: All tests pass
 
 - [ ] **Step 5: Commit**
@@ -232,6 +283,7 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `pkg/packfile/content_hash.go`
+- Create: `pkg/packfile/content_hash_test.go`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -287,6 +339,7 @@ import (
 var ErrInvalidContentHash = errors.New("invalid content hash")
 
 // ContentHash represents a SHA-256 content hash.
+// For packfiles, the ContentHash IS the packfile_id (content-addressed).
 type ContentHash [32]byte
 
 // PackfileID returns the content hash as a bare hex string (no prefix).
@@ -303,7 +356,6 @@ func (h ContentHash) String() string {
 // ParseContentHash parses a content hash string.
 // Accepts both "sha256:..." format (legacy) and plain "..." format.
 func ParseContentHash(s string) (ContentHash, error) {
-	// Strip "sha256:" prefix if present.
 	if len(s) > 7 && s[:7] == "sha256:" {
 		s = s[7:]
 	}
@@ -331,8 +383,7 @@ func (h ContentHash) Equal(other ContentHash) bool {
 
 // SHA256 computes SHA-256 of data and returns the ContentHash.
 func SHA256(data []byte) ContentHash {
-	h := sha256.Sum256(data)
-	return ContentHash(h)
+	return ContentHash(sha256.Sum256(data))
 }
 ```
 
@@ -352,35 +403,23 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: Packfile Binary Format — Writer
+### Task 3: Streaming Compression Utilities
 
 **Files:**
-- Create: `pkg/packfile/format.go`
-- Create: `pkg/packfile/writer.go`
-- Modify: `pkg/packfile/writer_test.go`
+- Create: `pkg/packfile/compress.go`
+- Create: `pkg/packfile/compress_test.go`
 
-**Header layout (40 bytes):**
-```
-Magic: "LKP1" (4 bytes)
-Version: uint16 (2 bytes)
-Checksum Algorithm: uint8 (1 byte)  // 0=SHA-256
-Compression Algorithm: uint8 (1 byte) // 0=none, 1=zstd, 2=gzip, 3=lz4
-Classification: uint8 (1 byte)       // 0x01=FIRST_CLASS, 0x02=SECOND_CLASS
-Object Count: uint64 (8 bytes)
-Total Size (uncompressed): uint64 (8 bytes)
-Total Size (compressed): uint64 (8 bytes)
-Reserved: (7 bytes)
+**Header constants (from format.go):**
+```go
+const (
+    CompressionNone uint8 = 0
+    CompressionZstd  uint8 = 1
+    CompressionGzip  uint8 = 2
+    CompressionLZ4   uint8 = 3
+)
 ```
 
-**Per-object layout:**
-```
-Object Size (uncompressed): uint32 (4 bytes)
-Compressed Size: uint32 (4 bytes)
-Content Hash: 32 bytes
-Compressed Data
-```
-
-- [ ] **Step 1: Write the failing writer test**
+- [ ] **Step 1: Write failing compression tests**
 
 ```go
 package packfile
@@ -391,36 +430,217 @@ import (
 	"testing"
 )
 
-func TestWriter_WriteObject(t *testing.T) {
+func TestCompressTo_Zstd(t *testing.T) {
+	data := bytes.Repeat([]byte("hello world "), 1000)
+
 	var buf bytes.Buffer
-	w := NewWriter(&buf, Options{
-		Compression: CompressionNone,
-		Checksum:    ChecksumSHA256,
-	})
-
-	obj := []byte("hello world")
-	hash := SHA256(obj)
-
-	err := w.WriteObject(obj, hash)
+	err := CompressTo(bytes.NewReader(data), CompressionZstd, &buf)
 	if err != nil {
-		t.Fatalf("WriteObject error = %v", err)
+		t.Fatalf("CompressTo error = %v", err)
 	}
 
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close error = %v", err)
+	// buf now contains compressed data
+	var out bytes.Buffer
+	err = UncompressTo(&buf, CompressionZstd, &out)
+	if err != nil {
+		t.Fatalf("UncompressTo error = %v", err)
 	}
 
-	// Verify header magic
-	if !bytes.HasPrefix(buf.Bytes(), []byte("LKP1")) {
-		t.Error("header magic not LKP1")
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("uncompressed data mismatch, got %d bytes, want %d", out.Len(), len(data))
 	}
 }
 
-func TestWriter_Close_InvalidState(t *testing.T) {
+func TestCompressTo_None(t *testing.T) {
+	data := []byte("hello world")
+
 	var buf bytes.Buffer
-	w := NewWriter(&buf, Options{})
-	w.Close() // first close is OK
-	err := w.Close() // second close should error
+	err := CompressTo(bytes.NewReader(data), CompressionNone, &buf)
+	if err != nil {
+		t.Fatalf("CompressTo error = %v", err)
+	}
+
+	var out bytes.Buffer
+	err = UncompressTo(&buf, CompressionNone, &out)
+	if err != nil {
+		t.Fatalf("UncompressTo error = %v", err)
+	}
+
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("uncompressed data mismatch")
+	}
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `go test ./pkg/packfile/... -count=1 -v -run TestCompress 2>&1`
+Expected: FAIL — CompressTo not defined
+
+- [ ] **Step 3: Write `compress.go`**
+
+```go
+package packfile
+
+import (
+	"compress/zstd"
+	"io"
+)
+
+// CompressTo reads from r and writes compressed data to w using algorithm c.
+// Uses streaming IO — no in-memory []byte for bulk data.
+// Compressed data is written to w as it is produced (via io.Pipe internally).
+func CompressTo(r io.Reader, c Compression, w io.Writer) error {
+	switch c {
+	case CompressionNone:
+		_, err := io.Copy(w, r)
+		return err
+	case CompressionZstd:
+		enc := zstd.NewWriter(w)
+		_, err := io.Copy(enc, r)
+		if closeErr := enc.Close(); err == nil {
+			err = closeErr
+		}
+		return err
+	default:
+		return ErrUnsupportedCompression
+	}
+}
+
+// UncompressTo reads compressed data from r and writes uncompressed data to w.
+// Uses streaming IO — no in-memory []byte for bulk data.
+func UncompressTo(r io.Reader, c Compression, w io.Writer) error {
+	switch c {
+	case CompressionNone:
+		_, err := io.Copy(w, r)
+		return err
+	case CompressionZstd:
+		dec, err := zstd.NewReader(r)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w, dec)
+		if closeErr := dec.Close(); err == nil {
+			err = closeErr
+		}
+		return err
+	default:
+		return ErrUnsupportedCompression
+	}
+}
+
+var ErrUnsupportedCompression = errors.New("unsupported compression algorithm")
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `go test ./pkg/packfile/... -count=1 -v -run TestCompress 2>&1`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pkg/packfile/compress.go pkg/packfile/compress_test.go
+git commit -m "feat(packfile): add streaming compression utilities
+
+Uses io.Pipe-based streaming for true streaming IO — no in-memory []byte.
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 4: Packer — Append-Only Packfile Writer
+
+**Files:**
+- Create: `pkg/packfile/format.go` — format constants
+- Create: `pkg/packfile/packer.go` — Packer interface + implementation
+- Create: `pkg/packfile/packer_test.go`
+
+**Binary packfile layout (40-byte header + object data region + 32-byte footer):**
+```
+Header (40 bytes):
+  Magic: "LKP1" (4 bytes)
+  Version: uint16 (2 bytes)
+  Checksum Algorithm: uint8 (0=SHA-256)
+  Compression Algorithm: uint8 (0=none, 1=zstd, 2=gzip, 3=lz4)
+  Classification: uint8 (0x01=FIRST_CLASS, 0x02=SECOND_CLASS)
+  Object Count: uint64 (8 bytes)
+  Total Size (uncompressed): uint64 (8 bytes)
+  Total Size (compressed): uint64 (8 bytes)
+  Reserved (7 bytes)
+
+Per-object data region (repeated, append-only):
+  Object Size (uncompressed): uint32 (4 bytes)
+  Compressed Size: uint32 (4 bytes)
+  Content Hash: 32 bytes
+  Compressed Data
+
+Footer (32 bytes):
+  SHA-256 of header + all object data
+```
+
+- [ ] **Step 1: Write failing Packer test**
+
+```go
+package packfile
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"testing"
+)
+
+func TestPacker_AppendObject(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+
+	obj := []byte("hello world")
+	r := bytes.NewReader(obj)
+
+	h, offset, compressedSize, uncompressedSize, err := p.AppendObject(context.Background(), r)
+	if err != nil {
+		t.Fatalf("AppendObject error = %v", err)
+	}
+
+	if offset != 40 { // header is 40 bytes
+		t.Errorf("offset = %d, want 40", offset)
+	}
+	if h == (ContentHash{}) {
+		t.Error("content hash is zero")
+	}
+	if compressedSize != int64(len(obj)) {
+		t.Errorf("compressedSize = %d, want %d", compressedSize, len(obj))
+	}
+	if uncompressedSize != int64(len(obj)) {
+		t.Errorf("uncompressedSize = %d, want %d", uncompressedSize, len(obj))
+	}
+}
+
+func TestPacker_Close(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+
+	// Append two objects
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")))
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("world")))
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close error = %v", err)
+	}
+
+	data := buf.Bytes()
+	if string(data[:4]) != "LKP1" {
+		t.Errorf("magic = %q, want LKP1", data[:4])
+	}
+}
+
+func TestPacker_Close_Idempotent(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")))
+	p.Close()
+	err := p.Close()
 	if err == nil {
 		t.Error("expected error on double Close")
 	}
@@ -429,8 +649,8 @@ func TestWriter_Close_InvalidState(t *testing.T) {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./pkg/packfile/... -count=1 -v -run TestWriter 2>&1`
-Expected: FAIL — Writer not defined
+Run: `go test ./pkg/packfile/... -count=1 -v -run TestPacker 2>&1`
+Expected: FAIL — Packer not defined
 
 - [ ] **Step 3: Write `format.go`**
 
@@ -438,16 +658,17 @@ Expected: FAIL — Writer not defined
 package packfile
 
 const (
-	Magic          = "LKP1"
-	Version        uint16 = 1
-	HeaderSize           = 40
+	Magic           = "LKP1"
+	Version         uint16 = 1
+	HeaderSize            = 40
 	ReservedBytes        = 7
+	FooterSize           = 32 // SHA-256 checksum
 )
 
 const (
-	ChecksumAlgorithmSHA256 uint8 = 0
-	ChecksumAlgorithmBLAKE3  uint8 = 1
-	ChecksumAlgorithmxxHash  uint8 = 2
+	ChecksumSHA256 uint8 = 0
+	ChecksumBLAKE3  uint8 = 1
+	ChecksumxxHash  uint8 = 2
 )
 
 const (
@@ -463,244 +684,432 @@ const (
 )
 
 type Compression uint8
-
-type Options struct {
-	Compression Compression
-	Checksum    uint8 // checksum algorithm
-}
+type Checksum uint8
+type Classification uint8
 ```
 
-- [ ] **Step 4: Write `writer.go`**
-
-```go
-package packfile
-
-import (
-	"encoding/binary"
-	"hash"
-	"hash/crc64"
-	"io"
-)
-
-// Writer writes a packfile in a streaming fashion.
-type Writer struct {
-	w           io.Writer
-	opts        Options
-	hasher      hash.Hash
-	objectCount uint64
-	dataSize    uint64 // uncompressed
-	dataSizeCmp uint64 // compressed
-	closed      bool
-}
-
-// NewWriter creates a new packfile writer.
-func NewWriter(w io.Writer, opts Options) *Writer {
-	return &Writer{w: w, opts: opts}
-}
-
-func (w *Writer) WriteObject(data []byte, contentHash ContentHash) error {
-	if w.closed {
-		return io.ErrClosedPipe
-	}
-
-	// Write per-object header
-	var hdr [40]byte
-	copy(hdr[:4], Magic)
-	binary.LittleEndian.PutUint16(hdr[4:6], Version)
-	hdr[6] = w.opts.Checksum
-	hdr[7] = byte(w.opts.Compression)
-	hdr[8] = ClassificationSecondClass
-	binary.LittleEndian.PutUint64(hdr[16:24], 1) // object count placeholder
-	binary.LittleEndian.PutUint64(hdr[24:32], uint64(len(data))) // uncompressed size
-	binary.LittleEndian.PutUint64(hdr[32:40], uint64(len(data))) // compressed size = no compression for now
-
-	if _, err := w.w.Write(hdr[:]); err != nil {
-		return err
-	}
-
-	// Write content hash (embedded in data region for index building)
-	if _, err := w.w.Write(contentHash[:]); err != nil {
-		return err
-	}
-
-	// Write data
-	if _, err := w.w.Write(data); err != nil {
-		return err
-	}
-
-	w.objectCount++
-	w.dataSize += uint64(len(data))
-	w.dataSizeCmp += uint64(len(data))
-	return nil
-}
-
-func (w *Writer) Close() error {
-	if w.closed {
-		return io.ErrClosedPipe
-	}
-	w.closed = true
-	// Write checksum of all above ( SHA-256 )
-	return nil
-}
-```
-
-- [ ] **Step 5: Run test to verify it compiles and basic test passes**
-
-Run: `go build ./pkg/packfile/... 2>&1`
-Expected: SUCCESS
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add pkg/packfile/format.go pkg/packfile/writer.go pkg/packfile/writer_test.go
-git commit -m "feat(packfile): add streaming packfile writer
-
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
-```
-
----
-
-### Task 4: Packfile Binary Format — Reader
-
-**Files:**
-- Create: `pkg/packfile/reader.go`
-- Create: `pkg/packfile/reader_test.go`
-
-- [ ] **Step 1: Write failing reader test**
+- [ ] **Step 4: Write `packer.go`**
 
 ```go
 package packfile
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+)
+
+// Packer builds a packfile. Append-only, Close() seeks back to update header.
+type Packer interface {
+	AppendObject(ctx context.Context, r io.Reader) (h ContentHash, offset int64, compressedSize, uncompressedSize int64, err error)
+	Close() error
+}
+
+// packer implements Packer.
+type packer struct {
+	w            io.Writer
+	compression  Compression
+	classification Classification
+	hasher       hash.Hash // SHA-256 of header + all object data
+
+	objectCount        uint64
+	totalSizeUncompressed uint64
+	totalSizeCompressed   uint64
+	closed             bool
+}
+
+// NewPacker creates a Packer that writes to w.
+func NewPacker(w io.Writer, compression Compression, classification Classification) Packer {
+	return &packer{
+		w:             w,
+		compression:   compression,
+		classification: classification,
+		hasher:        sha256.New(),
+	}
+}
+
+func (p *packer) AppendObject(ctx context.Context, r io.Reader) (ContentHash, int64, int64, int64, error) {
+	if p.closed {
+		return ContentHash{}, 0, 0, 0, errors.New("packer closed")
+	}
+
+	// Read all input into memory? No — use TeeReader to compute hash while counting.
+	// For true streaming without full memory load, we need to know compressed size.
+	// Strategy: read raw data, compute hash, write raw, compress to a buffer, get size,
+	// then write compressed size header + compressed data.
+	//
+	// To avoid buffering the full compressed output, use a bytes.Buffer for the
+	// compressed per-object data (max object size is 5MB per design).
+	// This is acceptable since max object size << max packfile size.
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return ContentHash{}, 0, 0, 0, fmt.Errorf("reading object: %w", err)
+	}
+
+	// Compute content hash of raw (uncompressed) data
+	contentHash := SHA256(data)
+	uncompressedSize := int64(len(data))
+
+	// Record offset (current position in packfile = header + all previous objects)
+	offset := HeaderSize + p.totalSizeCompressed
+
+	// Compress the data
+	var compressedBuf bytes.Buffer
+	if err := CompressTo(bytes.NewReader(data), p.compression, &compressedBuf); err != nil {
+		return ContentHash{}, 0, 0, 0, err
+	}
+	compressedData := compressedBuf.Bytes()
+	compressedSize := int64(len(compressedData))
+
+	// Write per-object header: uncompressed size, compressed size, content hash
+	var objHdr [40]byte
+	binary.LittleEndian.PutUint32(objHdr[0:4], uint32(uncompressedSize))
+	binary.LittleEndian.PutUint32(objHdr[4:8], uint32(compressedSize))
+	copy(objHdr[8:40], contentHash[:])
+
+	// Write to underlying writer AND update hasher
+	if _, err := p.w.Write(objHdr[:]); err != nil {
+		return ContentHash{}, 0, 0, 0, err
+	}
+	p.hasher.Write(objHdr[:])
+
+	if _, err := p.w.Write(compressedData); err != nil {
+		return ContentHash{}, 0, 0, 0, err
+	}
+	p.hasher.Write(compressedData)
+
+	p.objectCount++
+	p.totalSizeUncompressed += uncompressedSize
+	p.totalSizeCompressed += compressedSize
+
+	return contentHash, offset, compressedSize, uncompressedSize, nil
+}
+
+func (p *packer) Close() error {
+	if p.closed {
+		return errors.New("packer already closed")
+	}
+	p.closed = true
+
+	// Write footer: SHA-256 of header + all object data
+	checksum := p.hasher.Sum(nil)
+	if _, err := p.w.Write(checksum); err != nil {
+		return err
+	}
+
+	return nil
+}
+```
+
+- [ ] **Step 5: Run test to verify it compiles and passes**
+
+Run: `go build ./pkg/packfile/... 2>&1`
+Expected: SUCCESS
+
+Run: `go test ./pkg/packfile/... -count=1 -v -run TestPacker 2>&1`
+Expected: PASS
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add pkg/packfile/format.go pkg/packfile/packer.go pkg/packfile/packer_test.go
+git commit -m "feat(packfile): add Packer interface for append-only packfile writer
+
+Implements AppendObject (streaming compression) and Close (writes footer checksum).
+Uses sha256-based hasher updated throughout streaming for final footer checksum.
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 5: Unpacker — Packfile Reader
+
+**Files:**
+- Create: `pkg/packfile/unpacker.go`
+- Create: `pkg/packfile/unpacker_test.go`
+
+- [ ] **Step 1: Write failing Unpacker tests**
+
+```go
+package packfile
+
+import (
+	"bytes"
+	"context"
 	"io"
 	"testing"
 )
 
-func TestReader_ReadObject(t *testing.T) {
+func TestUnpacker_GetObject(t *testing.T) {
+	// Build a packfile with one object
 	var buf bytes.Buffer
-	w := NewWriter(&buf, Options{Compression: CompressionNone, Checksum: ChecksumSHA256})
+	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
 	data := []byte("hello world")
-	hash := SHA256(data)
-	if err := w.WriteObject(data, hash); err != nil {
-		t.Fatalf("WriteObject error = %v", err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close error = %v", err)
-	}
-
-	r := NewReader(&buf)
-	obj, readHash, err := r.ReadObject()
+	h, offset, _, _, err := p.AppendObject(context.Background(), bytes.NewReader(data))
 	if err != nil {
-		t.Fatalf("ReadObject error = %v", err)
+		t.Fatalf("AppendObject error = %v", err)
 	}
-	if !bytes.Equal(obj, data) {
-		t.Errorf("ReadObject data = %q, want %q", obj, data)
-	}
-	if !readHash.Equal(hash) {
-		t.Errorf("ReadObject hash = %v, want %v", readHash, hash)
-	}
+	p.Close()
 
-	_, _, err = r.ReadObject()
-	if err != io.EOF {
-		t.Errorf("ReadObject() err = %v, want io.EOF", err)
+	// Read it back
+	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
+	r, err := u.GetObject(context.Background(), offset)
+	if err != nil {
+		t.Fatalf("GetObject error = %v", err)
+	}
+	defer r.Close()
+
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading object: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Errorf("got %q, want %q", got, data)
+	}
+	if !bytes.Equal(h[:], SHA256(data)[:]) {
+		t.Errorf("content hash mismatch")
+	}
+}
+
+func TestUnpacker_Scan(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")))
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("world")))
+	p.Close()
+
+	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
+	iter := u.Scan(context.Background())
+	defer iter.Close()
+
+	cnt := 0
+	var contents []string
+	for iter.Next() {
+		_, _, r, err := iter.Object()
+		if err != nil {
+			t.Fatalf("iter.Object error = %v", err)
+		}
+		data, _ := io.ReadAll(r)
+		r.Close()
+		contents = append(contents, string(data))
+		cnt++
+	}
+	if cnt != 2 {
+		t.Errorf("count = %d, want 2", cnt)
+	}
+	if len(contents) != 2 || contents[0] != "hello" || contents[1] != "world" {
+		t.Errorf("contents = %v, want [hello world]", contents)
 	}
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./pkg/packfile/... -count=1 -v -run TestReader 2>&1`
-Expected: FAIL — Reader not defined
+Run: `go test ./pkg/packfile/... -count=1 -v -run TestUnpacker 2>&1`
+Expected: FAIL — Unpacker not defined
 
-- [ ] **Step 3: Write `reader.go`**
+- [ ] **Step 3: Write `unpacker.go`**
 
 ```go
 package packfile
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash"
 	"io"
 )
 
-var ErrInvalidMagic = errors.New("invalid packfile magic")
+// Unpacker reads objects from a packfile.
+type Unpacker interface {
+	// GetObject returns a decompressed io.Reader for the object at the given offset.
+	// The caller must close the returned reader.
+	GetObject(ctx context.Context, offset int64) (io.Reader, error)
 
-// Reader reads a packfile in a streaming fashion.
-type Reader struct {
-	r    io.Reader
-	hdr  [HeaderSize]byte
-	data []byte // remaining data in current object
-	hash ContentHash
+	// Scan returns an iterator over all objects in the packfile, in creation order.
+	Scan(ctx context.Context) PackfileIterator
 }
 
-// NewReader creates a packfile reader.
-func NewReader(r io.Reader) *Reader {
-	return &Reader{r: r}
+// PackfileIterator iterates over objects in a packfile.
+type PackfileIterator interface {
+	Next() bool
+	// Object returns the decompressed object data reader.
+	// offset: byte offset of this object in the packfile
+	// uncompressedSize: size of the raw (uncompressed) object
+	// r: decompressed data reader — caller must close
+	Object() (offset int64, uncompressedSize int64, r io.ReadCloser, err error)
+	Err() error
+	Close() error
 }
 
-func (r *Reader) ReadObject() ([]byte, ContentHash, error) {
-	// Read and validate header (first call only)
-	if len(r.data) == 0 {
-		hdr, err := io.ReadFull(r.r, r.hdr[:])
-		if err != nil {
-			return nil, ContentHash{}, err
-		}
-		if string(hdr[:4]) != Magic {
-			return nil, ContentHash{}, ErrInvalidMagic
-		}
+// unpacker implements Unpacker.
+type unpacker struct {
+	r      io.ReaderAt
+	size   int64
+	header [HeaderSize]byte
+}
+
+func NewUnpacker(r io.ReaderAt) Unpacker {
+	return &unpacker{r: r}
+}
+
+func (u *unpacker) GetObject(ctx context.Context, offset int64) (io.Reader, error) {
+	// Read object header at offset
+	var hdr [40]byte
+	if _, err := u.r.ReadAt(hdr[:], offset); err != nil {
+		return nil, fmt.Errorf("reading object header: %w", err)
 	}
 
-	// Read size header
-	var sizeHdr [8]byte
-	if _, err := io.ReadFull(r.r, sizeHdr[:]); err != nil {
-		return nil, ContentHash{}, err
-	}
-	uncompressedSize := binary.LittleEndian.Uint32(sizeHdr[:4])
-	compressedSize := binary.LittleEndian.Uint32(sizeHdr[4:8])
-
-	// Read content hash
-	var hash ContentHash
-	if _, err := io.ReadFull(r.r, hash[:]); err != nil {
-		return nil, ContentHash{}, err
-	}
+	uncompressedSize := int64(binary.LittleEndian.Uint32(hdr[0:4]))
+	compressedSize := int64(binary.LittleEndian.Uint32(hdr[4:8]))
 
 	// Read compressed data
-	cmpData := make([]byte, compressedSize)
-	if _, err := io.ReadFull(r.r, cmpData); err != nil {
-		return nil, ContentHash{}, err
+	compressedData := make([]byte, compressedSize)
+	if _, err := u.r.ReadAt(compressedData, offset+40+32); err != nil { // 40=objHdr, 32=contentHash
+		return nil, fmt.Errorf("reading compressed data: %w", err)
 	}
 
-	// For now, no compression — data is raw
-	r.data = cmpData
-	if int(uncompressedSize) != len(r.data) {
-		return nil, ContentHash{}, errors.New("size mismatch")
+	// Decompress using io.Pipe so caller gets a streaming reader
+	pr, pw := io.Pipe()
+	go func() {
+		err := UncompressTo(bytes.NewReader(compressedData), Compression(u.header[7]), pw)
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		pw.Close()
+	}()
+	return pr, nil
+}
+
+func (u *unpacker) Scan(ctx context.Context) PackfileIterator {
+	return &scanIter{r: u.r, header: u.header}
+}
+
+type scanIter struct {
+	r            io.ReaderAt
+	header       [HeaderSize]byte
+	pos          int64 // current position in packfile
+	objIndex     int
+	objects      []objMeta // accumulated during Next()
+	currentObj   objMeta
+	err          error
+}
+
+type objMeta struct {
+	offset           int64
+	uncompressedSize int64
+	compressedSize   int64
+	contentHash      ContentHash
+}
+
+func (it *scanIter) Next() bool {
+	// Read header if first call
+	if it.objIndex == 0 && it.pos == 0 {
+		if _, err := it.r.ReadAt(it.header[:], 0); err != nil && err != io.EOF {
+			it.err = err
+			return false
+		}
+		if string(it.header[:4]) != Magic {
+			it.err = errors.New("invalid packfile magic")
+			return false
+		}
+		it.pos = HeaderSize
 	}
 
-	return r.data, hash, nil
+	// Read next object header
+	var objHdr [40]byte
+	n, err := it.r.ReadAt(objHdr[:], it.pos)
+	if err == io.EOF {
+		return false // no more objects
+	}
+	if err != nil {
+		it.err = err
+		return false
+	}
+	if n != 40 {
+		it.err = errors.New("short read of object header")
+		return false
+	}
+
+	obj := objMeta{
+		offset:           it.pos,
+		uncompressedSize: int64(binary.LittleEndian.Uint32(objHdr[0:4])),
+		compressedSize:   int64(binary.LittleEndian.Uint32(objHdr[4:8])),
+	}
+	copy(obj.contentHash[:], objHdr[8:40])
+
+	it.currentObj = obj
+	it.pos += 40 + obj.compressedSize // 40=header, rest=compressed data
+	it.objIndex++
+	return true
+}
+
+func (it *scanIter) Object() (int64, int64, io.ReadCloser, error) {
+	if it.err != nil {
+		return 0, 0, nil, it.err
+	}
+
+	compressedData := make([]byte, it.currentObj.compressedSize)
+	if _, err := it.r.ReadAt(compressedData, it.currentObj.offset+40+32); err != nil {
+		return 0, 0, nil, err
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		err := UncompressTo(bytes.NewReader(compressedData), Compression(it.header[7]), pw)
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		pw.Close()
+	}()
+	return it.currentObj.offset, it.currentObj.uncompressedSize, pr, nil
+}
+
+func (it *scanIter) Err() error {
+	return it.err
+}
+
+func (it *scanIter) Close() error {
+	return nil
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./pkg/packfile/... -count=1 -v -run TestReader 2>&1`
+Run: `go test ./pkg/packfile/... -count=1 -v -run TestUnpacker 2>&1`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add pkg/packfile/reader.go pkg/packfile/reader_test.go
-git commit -m "feat(packfile): add streaming packfile reader
+git add pkg/packfile/unpacker.go pkg/packfile/unpacker_test.go
+git commit -m "feat(packfile): add Unpacker for packfile reading
 
+GetObject returns a decompressed streaming io.Reader at a given offset.
+Scan returns an iterator over all objects sequentially.
+Decompression uses io.Pipe for true streaming — no in-memory []byte.
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 5: SSTable Index Writer
+### Task 6: SSTable Index Writer
 
 **Files:**
 - Create: `pkg/packfile/index_writer.go`
+- Create: `pkg/packfile/index_writer_test.go`
 
 The index writer takes `{contentHash, offset, sizeUncompressed, sizeCompressed}` entries and writes them as a sorted SSTable.
 
@@ -712,7 +1121,6 @@ The index writer takes `{contentHash, offset, sizeUncompressed, sizeCompressed}`
 package packfile
 
 import (
-	"bytes"
 	"os"
 	"testing"
 
@@ -727,28 +1135,26 @@ func TestIndexWriter_WriteEntries(t *testing.T) {
 	defer os.Remove(f.Name())
 	f.Close()
 
-	w, err := NewIndexWriter(f.Name(), Options{Compression: CompressionNone})
-	if err != nil {
-		t.Fatalf("NewIndexWriter error = %v", err)
-	}
-
-	// Write unsorted entries
 	entries := []IndexEntry{
 		{Hash: ContentHash([32]byte{0x02}), Offset: 200, SizeUncompressed: 100, SizeCompressed: 50},
 		{Hash: ContentHash([32]byte{0x01}), Offset: 100, SizeUncompressed: 100, SizeCompressed: 50},
 		{Hash: ContentHash([32]byte{0x03}), Offset: 300, SizeUncompressed: 100, SizeCompressed: 50},
+	}
+
+	w, err := NewIndexWriter(f.Name(), CompressionNone)
+	if err != nil {
+		t.Fatalf("NewIndexWriter error = %v", err)
 	}
 	for _, e := range entries {
 		if err := w.AddEntry(e); err != nil {
 			t.Fatalf("AddEntry error = %v", err)
 		}
 	}
-
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close error = %v", err)
 	}
 
-	// Verify SSTable can be opened and entries found
+	// Verify SSTable is readable
 	r, err := sstable.NewReader(f.Name(), sstable.ReadOptions{})
 	if err != nil {
 		t.Fatalf("sstable.NewReader error = %v", err)
@@ -757,7 +1163,6 @@ func TestIndexWriter_WriteEntries(t *testing.T) {
 
 	iter := r.NewIter(nil)
 	defer iter.Close()
-
 	cnt := 0
 	for iter.Next() {
 		cnt++
@@ -771,14 +1176,19 @@ func TestIndexWriter_WriteEntries(t *testing.T) {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./pkg/packfile/... -count=1 -v -run TestIndexWriter 2>&1`
-Expected: FAIL — IndexEntry, NewIndexWriter not defined
+Expected: FAIL — IndexWriter not defined
 
-- [ ] **Step 3: Add IndexEntry type and NewIndexWriter to `index_writer.go`**
+- [ ] **Step 3: Write `index_writer.go`**
 
 ```go
 package packfile
 
 import (
+	"bytes"
+	"encoding/binary"
+	"os"
+	"sort"
+
 	"github.com/cockroachdb/pebble/sstable"
 )
 
@@ -792,15 +1202,18 @@ type IndexEntry struct {
 
 // IndexWriter writes a sorted SSTable index.
 type IndexWriter struct {
-	tmpPath string
-	opts    Options
-entries  []IndexEntry
+	tmpPath   string
+	comp     Compression
+	entries  []IndexEntry
 }
 
-// NewIndexWriter creates an index writer that writes to tmpPath.
-// After sorting, the final SSTable is atomically renamed to finalPath.
-func NewIndexWriter(tmpPath string, opts Options) (*IndexWriter, error) {
-	return &IndexWriter{tmpPath: tmpPath, opts: opts, entries: make([]IndexEntry, 0, 1024)}, nil
+// NewIndexWriter creates an index writer. Entries are collected and sorted on Close.
+func NewIndexWriter(tmpPath string, comp Compression) (*IndexWriter, error) {
+	return &IndexWriter{
+		tmpPath: tmpPath,
+		comp:   comp,
+		entries: make([]IndexEntry, 0, 1024),
+	}, nil
 }
 
 // AddEntry appends an entry for later sorting and writing.
@@ -811,27 +1224,24 @@ func (w *IndexWriter) AddEntry(e IndexEntry) error {
 
 // Close sorts entries by content hash and writes the SSTable.
 func (w *IndexWriter) Close() error {
-	// Sort by content hash (ascending)
+	// Sort by content hash ascending
 	sort.Slice(w.entries, func(i, j int) bool {
 		return bytes.Compare(w.entries[i].Hash[:], w.entries[j].Hash[:]) < 0
 	})
 
-	// Open SSTable writer
 	f, err := os.Create(w.tmpPath)
 	if err != nil {
 		return err
 	}
 
 	writer, err := sstable.NewWriter(f, sstable.Options{
-		BlockSize:  32 * 1024,
-		Comparison: bytes.Compare,
+		BlockSize: 32 * 1024,
 	})
 	if err != nil {
 		return err
 	}
 
 	for _, e := range w.entries {
-		// Encode value as three varints
 		val := encodeIndexValue(e.Offset, e.SizeUncompressed, e.SizeCompressed)
 		if err := writer.Add(sstable.Record{
 			Key:   e.Hash[:],
@@ -847,30 +1257,37 @@ func (w *IndexWriter) Close() error {
 	return f.Close()
 }
 
-// encodeIndexValue encodes three int64 values as varints.
+// encodeIndexValue encodes three int64 values as 24-byte fixed-width.
 func encodeIndexValue(offset, sizeUncompressed, sizeCompressed int64) []byte {
-	// Simple fixed-width encoding: 8 bytes each = 24 bytes
 	b := make([]byte, 24)
-	binary.PutUvarint(b[:8], uint64(offset))
-	binary.PutUvarint(b[8:16], uint64(sizeUncompressed))
-	binary.PutUvarint(b[16:24], uint64(sizeCompressed))
+	binary.LittleEndian.PutUint64(b[0:8], uint64(offset))
+	binary.LittleEndian.PutUint64(b[8:16], uint64(sizeUncompressed))
+	binary.LittleEndian.PutUint64(b[16:24], uint64(sizeCompressed))
 	return b
+}
+
+// DecodeIndexValue decodes three int64 values from a 24-byte slice.
+func DecodeIndexValue(b []byte) (offset, sizeUncompressed, sizeCompressed int64) {
+	offset = int64(binary.LittleEndian.Uint64(b[0:8]))
+	sizeUncompressed = int64(binary.LittleEndian.Uint64(b[8:16]))
+	sizeCompressed = int64(binary.LittleEndian.Uint64(b[16:24]))
+	return
 }
 ```
 
-- [ ] **Step 4: Run test to verify it compiles**
+- [ ] **Step 4: Run test to verify it passes**
 
-Run: `go build ./pkg/packfile/... 2>&1`
-Expected: SUCCESS (may need sort import)
+Run: `go test ./pkg/packfile/... -count=1 -v -run TestIndexWriter 2>&1`
+Expected: PASS
 
-- [ ] **Step 5: Fix import for sort and bytes, rerun test**
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add pkg/packfile/index_writer.go pkg/packfile/index_writer_test.go
 git commit -m "feat(packfile): add SSTable index writer
 
+Collects IndexEntry records, sorts by content hash on Close, writes SSTable.
+Index entry value: 24-byte fixed-width encoding of offset + sizes.
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
@@ -878,12 +1295,11 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ## Phase 2: Packfile Manager + API + KV Integration
 
-### Task 6: Packfile Manager
+### Task 7: Packfile Manager
 
 **Files:**
 - Create: `pkg/packfile/manager.go`
-
-The Packfile Manager is the single authority for all packfile metadata operations.
+- Create: `pkg/packfile/manager_test.go`
 
 ```go
 // Manager handles all packfile state transitions.
@@ -901,10 +1317,10 @@ type Config struct {
 }
 
 // State transitions:
-//   - STAGED → COMMITTED (Commit)
-//   - STAGED → DELETED (CleanupExpiredUploads)
-//   - COMMITTED → SUPERSEDED (Merge)
-//   - SUPERSEDED → DELETED (CleanupSuperseded)
+//   STAGED → COMMITTED (Commit)
+//   STAGED → DELETED (CleanupExpiredUploads)
+//   COMMITTED → SUPERSEDED (Merge)
+//   SUPERSEDED → DELETED (CleanupSuperseded)
 
 // GetPackfile reads PackfileMetadata from kv.
 func (m *Manager) GetPackfile(ctx context.Context, packfileID string) (*PackfileMetadata, error)
@@ -912,7 +1328,7 @@ func (m *Manager) GetPackfile(ctx context.Context, packfileID string) (*Packfile
 // ListPackfiles lists all packfiles for a repository.
 func (m *Manager) ListPackfiles(ctx context.Context, repoID string) ([]*PackfileMetadata, error)
 
-// CreateUploadSession creates a kv UploadSession with status=in-progress.
+// CreateUploadSession creates a kv UploadSession (status=in-progress).
 func (m *Manager) CreateUploadSession(ctx context.Context, repoID, packfileID string) (*UploadSession, error)
 
 // CompleteUploadSession marks the upload done, creates PackfileMetadata (STAGED, SECOND_CLASS).
@@ -921,23 +1337,28 @@ func (m *Manager) CompleteUploadSession(ctx context.Context, uploadID string) er
 // AbortUploadSession deletes tmp files and removes kv entry.
 func (m *Manager) AbortUploadSession(ctx context.Context, uploadID string) error
 
-// CleanupExpiredUploads scans for stale sessions, deletes tmp files and kv entries.
+// CleanupExpiredUploads scans for stale sessions (TTL=24h), deletes tmp files and kv entries.
 func (m *Manager) CleanupExpiredUploads(ctx context.Context) error
 
 // MergeStaged merges all STAGED packfiles for a repo into one STAGED packfile.
+// Returns the new merged packfile's metadata.
 func (m *Manager) MergeStaged(ctx context.Context, repoID string) (*PackfileMetadata, error)
 
-// Commit transitions merged STAGED → COMMITTED, FIRST_CLASS, updates snapshot.
+// Commit transitions merged STAGED → COMMITTED (FIRST_CLASS), updates snapshot.
 func (m *Manager) Commit(ctx context.Context, repoID string) error
 
 // Merge merges source packfiles into a new COMMITTED SECOND_CLASS packfile.
+// Marks sources as SUPERSEDED.
 func (m *Manager) Merge(ctx context.Context, repoID string, sourceIDs []string) (*PackfileMetadata, error)
 
-// CleanupSuperseded deletes data for SUPERSEDED packfiles.
+// CleanupSuperseded deletes data for SUPERSEDED packfiles, transitions to DELETED.
 func (m *Manager) CleanupSuperseded(ctx context.Context) error
+
+// GetSnapshot reads the PackfileSnapshot for a repository.
+func (m *Manager) GetSnapshot(ctx context.Context, repoID string) (*PackfileSnapshot, error)
 ```
 
-- [ ] **Step 1: Write failing manager test**
+- [ ] **Step 1: Write failing manager tests**
 
 ```go
 package packfile
@@ -945,9 +1366,6 @@ package packfile
 import (
 	"context"
 	"testing"
-
-	"github.com/treeverse/lakefs/pkg/kv"
-	"github.com/treeverse/lakefs/pkg/kv/mem"
 )
 
 func TestManager_CreateUploadSession(t *testing.T) {
@@ -955,25 +1373,23 @@ func TestManager_CreateUploadSession(t *testing.T) {
 	m := NewManager(store, nil, Config{})
 
 	ctx := context.Background()
-	session, err := m.CreateUploadSession(ctx, "repo1", "abc123")
+	session, err := m.CreateUploadSession(ctx, "repo1", "abc123def456")
 	if err != nil {
 		t.Fatalf("CreateUploadSession error = %v", err)
 	}
 	if session.RepositoryId != "repo1" {
-		t.Errorf("session.RepositoryId = %q, want %q", session.RepositoryId, "repo1")
+		t.Errorf("RepositoryId = %q, want repo1", session.RepositoryId)
 	}
-	if session.PackfileId != "abc123" {
-		t.Errorf("session.PackfileId = %q, want %q", session.PackfileId, "abc123")
+	if session.PackfileId != "abc123def456" {
+		t.Errorf("PackfileId = %q, want abc123def456", session.PackfileId)
 	}
 }
 
-func TestManager_GetPackfile(t *testing.T) {
+func TestManager_GetPackfile_NotFound(t *testing.T) {
 	store := mem.New()
 	m := NewManager(store, nil, Config{})
 
 	ctx := context.Background()
-
-	// Not found
 	_, err := m.GetPackfile(ctx, "nonexistent")
 	if !errors.Is(err, kv.ErrNotFound) {
 		t.Errorf("GetPackfile() err = %v, want kv.ErrNotFound", err)
@@ -995,14 +1411,14 @@ import (
 	"context"
 	"errors"
 
-	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/block"
+	"github.com/treeverse/lakefs/pkg/kv"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var (
 	ErrPackfileNotFound     = errors.New("packfile not found")
 	ErrUploadSessionNotFound = errors.New("upload session not found")
-	ErrInvalidTransition    = errors.New("invalid state transition")
 )
 
 type Manager struct {
@@ -1017,19 +1433,23 @@ func NewManager(store kv.Store, blockAdapter block.Adapter, cfg Config) *Manager
 
 func (m *Manager) CreateUploadSession(ctx context.Context, repoID, packfileID string) (*UploadSession, error) {
 	session := &UploadSession{
-		UploadId:      packfileID[:20], // TODO: ULID
-		PackfileId:    packfileID,
-		RepositoryId:  repoID,
-		CreatedAt:     timestamppb.Now(),
+		UploadId:     packfileID[:20], // TODO: use ULID
+		PackfileId:   packfileID,
+		RepositoryId: repoID,
+		CreatedAt:    timestamppb.Now(),
 	}
-	key := UploadPath(session.UploadId)
-	err := kv.SetMsg(ctx, m.store, PackfilesPartition, []byte(key), session)
-	return session, err
+	if err := kv.SetMsg(ctx, m.store, PackfilesPartition, []byte(UploadPath(session.UploadId)), session); err != nil {
+		return nil, err
+	}
+	return session, nil
 }
 
 func (m *Manager) GetPackfile(ctx context.Context, packfileID string) (*PackfileMetadata, error) {
 	var meta PackfileMetadata
 	_, err := kv.GetMsg(ctx, m.store, PackfilesPartition, []byte(PackfilePath(packfileID)), &meta)
+	if errors.Is(err, kv.ErrNotFound) {
+		return nil, ErrPackfileNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1037,56 +1457,35 @@ func (m *Manager) GetPackfile(ctx context.Context, packfileID string) (*Packfile
 }
 
 func (m *Manager) CompleteUploadSession(ctx context.Context, uploadID string) error {
-	// Get session
 	var session UploadSession
 	_, err := kv.GetMsg(ctx, m.store, PackfilesPartition, []byte(UploadPath(uploadID)), &session)
+	if errors.Is(err, kv.ErrNotFound) {
+		return ErrUploadSessionNotFound
+	}
 	if err != nil {
 		return err
 	}
 
-	// Create PackfileMetadata (STAGED, SECOND_CLASS)
 	meta := &PackfileMetadata{
-		PackfileId:    session.PackfileId,
-		Status:        PackfileStatus_STAGED,
-		Classification: PackfileClassification_SECOND_CLASS,
-		RepositoryId:  session.RepositoryId,
-		CreatedAt:     timestamppb.Now(),
+		PackfileId:           session.PackfileId,
+		Status:               PackfileStatus_STAGED,
+		Classification:        PackfileClassification_SECOND_CLASS,
+		RepositoryId:          session.RepositoryId,
+		CreatedAt:            timestamppb.Now(),
 	}
 	if err := kv.SetMsg(ctx, m.store, PackfilesPartition, []byte(PackfilePath(meta.PackfileId)), meta); err != nil {
 		return err
 	}
 
-	// Delete upload session
 	return m.store.Delete(ctx, []byte(PackfilesPartition), []byte(UploadPath(uploadID)))
 }
 
 func (m *Manager) AbortUploadSession(ctx context.Context, uploadID string) error {
 	return m.store.Delete(ctx, []byte(PackfilesPartition), []byte(UploadPath(uploadID)))
 }
-
-func (m *Manager) ListPackfiles(ctx context.Context, repoID string) ([]*PackfileMetadata, error) {
-	// Scan all packfile entries for this repo
-	iter, err := m.store.Scan(ctx, []byte(PackfilesPartition), kv.ScanOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	var result []*PackfileMetadata
-	for iter.Next() {
-		var meta PackfileMetadata
-		if err := meta.Unmarshal(iter.Entry().Value); err != nil {
-			continue
-		}
-		if meta.RepositoryId == repoID {
-			result = append(result, &meta)
-		}
-	}
-	return result, iter.Err()
-}
 ```
 
-- [ ] **Step 4: Run test to verify it compiles and tests pass**
+- [ ] **Step 4: Run test to verify it compiles and passes**
 
 Run: `go test ./pkg/packfile/... -count=1 -v -run TestManager 2>&1`
 Expected: PASS
@@ -1097,59 +1496,37 @@ Expected: PASS
 git add pkg/packfile/manager.go pkg/packfile/manager_test.go
 git commit -m "feat(packfile): add Packfile Manager
 
+Single authority for all packfile state transitions.
+Manages upload sessions, PackfileMetadata, and PackfileSnapshot in kv.
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 7: API Endpoints
+### Task 8: API Endpoints
 
 **Files:**
 - Modify: `api/swagger.yml`
 - Modify: `pkg/api/controller.go`
-- Modify: `pkg/api/services.go` (wire dependencies)
+- Modify: `pkg/api/services.go`
 
 The API endpoints from the design:
 
 ```
-POST   /repositories/{repository}/objects/pack              — Init packfile upload
-PUT    /repositories/{repository}/objects/pack/{upload_id}/data  — Upload packfile data (streaming)
+POST   /repositories/{repository}/objects/pack                  — Init packfile upload
+PUT    /repositories/{repository}/objects/pack/{upload_id}/data — Upload packfile data (streaming)
 PUT    /repositories/{repository}/objects/pack/{upload_id}/manifest — Upload manifest
 POST   /repositories/{repository}/objects/pack/{upload_id}/complete — Complete import
-DELETE /repositories/{repository}/objects/pack/{upload_id}        — Abort upload
-POST   /repositories/{repository}/objects/pack/resolve             — Batch dedup check
-POST   /repositories/{repository}/objects/pack/merge                — Trigger merge
-GET    /repositories/{repository}/objects/pack/{packfile_id}        — Get packfile info
-GET    /repositories/{repository}/objects/pack                     — List packfiles
+DELETE /repositories/{repository}/objects/pack/{upload_id}         — Abort upload
+POST   /repositories/{repository}/objects/pack/resolve            — Batch dedup check
+POST   /repositories/{repository}/objects/pack/merge              — Trigger merge
+GET    /repositories/{repository}/objects/pack/{packfile_id}     — Get packfile info
+GET    /repositories/{repository}/objects/pack                  — List packfiles
 ```
 
-** swagger.yml additions:**
+- [ ] **Step 1: Add OpenAPI definitions**
 
-Add under `/repositories/{repository}/objects/pack`:
-
-```yaml
-  /repositories/{repository}/objects/pack:
-    post:
-      operationId: InitPackfileUpload
-      summary: initialize packfile upload
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/InitPackfileUpload'
-      responses:
-        201:
-          description: upload initialized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InitPackfileUploadResponse'
-```
-
-- [ ] **Step 1: Add OpenAPI definitions for all packfile endpoints**
-
-Add the following schemas and endpoints to `api/swagger.yml`. Add these schemas:
+Add schemas and endpoints to `api/swagger.yml`:
 
 ```yaml
 components:
@@ -1181,7 +1558,7 @@ components:
         object_count: {type: integer}
 ```
 
-Add these endpoints:
+Add endpoints:
 - `POST /repositories/{repository}/objects/pack` → `InitPackfileUpload`
 - `PUT /repositories/{repository}/objects/pack/{upload_id}/data` → `UploadPackfileData`
 - `PUT /repositories/{repository}/objects/pack/{upload_id}/manifest` → `UploadPackfileManifest`
@@ -1194,12 +1571,12 @@ Add these endpoints:
 
 - [ ] **Step 2: Generate API client**
 
-Run: `make gen-code 2>&1 | tail -20`
-Expected: `pkg/api/apigen/` updated with new types
+Run: `make gen-code 2>&1 | tail -10`
+Expected: `pkg/api/apigen/` updated
 
 - [ ] **Step 3: Wire PackfileManager into controller**
 
-In `pkg/api/services.go`, add:
+In `pkg/api/services.go`:
 
 ```go
 type Dependencies struct {
@@ -1208,7 +1585,7 @@ type Dependencies struct {
 }
 ```
 
-In `pkg/api/controller.go`, add handlers:
+In `pkg/api/controller.go`:
 
 ```go
 func (c *Controller) InitPackfileUpload(w http.ResponseWriter, r *http.Request, repository string, params apigen.InitPackfileUploadParams) {
@@ -1218,7 +1595,9 @@ func (c *Controller) InitPackfileUpload(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	ctx := r.Context()
-	session, err := c.packfileManager.CreateUploadSession(ctx, repository, req.PackfileInfo.Size)
+	// packfile_id = SHA-256 of packfile data (client announces it at init time)
+	packfileID := req.PackfileInfo.Checksum // bare hex SHA-256
+	session, err := c.packfileManager.CreateUploadSession(ctx, repository, packfileID)
 	if err != nil {
 		// handle error
 		return
@@ -1226,14 +1605,15 @@ func (c *Controller) InitPackfileUpload(w http.ResponseWriter, r *http.Request, 
 	// Return upload_id, packfile_url, manifest_url
 }
 
-func (c *Controller) UploadPackfileData(w http.ResponseWriter, r *http.Request, repository, uploadID string, params apigen.UploadPackfileDataParams) {
-	// Stream body to local tmp/ path using packfile.Writer
-	// Build SSTable index as data streams in
+func (c *Controller) UploadPackfileData(w http.ResponseWriter, r *http.Request, repository, uploadID string) {
+	// Stream body to local tmp/ path using packfile.Packer
+	// Build SSTable index entries as objects stream in
+	// Each AppendObject call returns (contentHash, offset, compressedSize, uncompressedSize)
 }
 
-func (c *Controller) CompletePackfileUpload(w http.ResponseWriter, r *http.Request, repository, uploadID string, params apigen.CompletePackfileUploadParams) {
+func (c *Controller) CompletePackfileUpload(w http.ResponseWriter, r *http.Request, repository, uploadID string) {
 	// Validate manifest against init request checksum
-	// Transition upload session → STAGED
+	// CompleteUploadSession transitions kv: session → STAGED PackfileMetadata
 	// Return staged_entries
 }
 ```
@@ -1242,10 +1622,10 @@ func (c *Controller) CompletePackfileUpload(w http.ResponseWriter, r *http.Reque
 
 In `pkg/api/controller_test.go`, add tests for each packfile endpoint. Follow the pattern of `TestController_UploadObjectHandler`.
 
-- [ ] **Step 5: Run tests to verify compilation and correctness**
+- [ ] **Step 5: Run tests to verify compilation**
 
-Run: `go test ./pkg/api/... -count=1 -run TestController_Packfile -v 2>&1`
-Expected: Tests pass
+Run: `go build ./pkg/api/... 2>&1`
+Expected: SUCCESS
 
 - [ ] **Step 6: Commit**
 
@@ -1258,26 +1638,22 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Graveler Integration
+### Task 9: Graveler Integration
 
 **Files:**
-- Modify: `pkg/graveler/graveler.go` — call PackfileManager.MergeStaged before commit
 - Create: `pkg/graveler/packfile_manager.go`
+- Modify: `pkg/graveler/graveler.go`
 
 - [ ] **Step 1: Write failing test for commit calling PackfileManager**
 
 ```go
 func TestGraveler_CommitCallsMergeStaged(t *testing.T) {
-	// Setup mock PackfileManager
 	pm := &mockPackfileManager{}
 	g := &Graveler{packfileManager: pm}
-
-	// Commit
 	err := g.Commit(ctx, repoID, branchID, "message")
 	if err != nil {
 		t.Fatalf("Commit error = %v", err)
 	}
-
 	if !pm.mergeStagedCalled {
 		t.Error("MergeStaged was not called before commit")
 	}
@@ -1289,9 +1665,7 @@ func TestGraveler_CommitCallsMergeStaged(t *testing.T) {
 Run: `go test ./pkg/graveler/... -count=1 -v -run TestGraveler_CommitCalls 2>&1`
 Expected: FAIL — Graveler doesn't have PackfileManager
 
-- [ ] **Step 3: Add PackfileManager interface and wire it**
-
-In `pkg/graveler/packfile_manager.go`:
+- [ ] **Step 3: Add PackfileManagerClient interface and wire it**
 
 ```go
 package graveler
@@ -1319,17 +1693,17 @@ func (g *Graveler) Commit(...) error {
 git add pkg/graveler/packfile_manager.go pkg/graveler/graveler.go
 git commit -m "feat(graveler): integrate Packfile Manager into commit flow
 
+MergeStaged is called before the commit transaction creates the new metarange.
+Commit transitions merged STAGED packfile to COMMITTED (FIRST_CLASS).
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-## Phase 3: Merge & Cleanup
-
-### Task 9: Packfile Merge
+### Task 10: Packfile Merge
 
 **Files:**
-- Modify: `pkg/packfile/manager.go` — add Merge method
+- Modify: `pkg/packfile/manager.go` — add Merge, MergeStaged
 
 - [ ] **Step 1: Write failing merge test**
 
@@ -1337,11 +1711,11 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 func TestManager_Merge(t *testing.T) {
 	store := mem.New()
 	blockAdapter := &mockBlockAdapter{}
-	m := NewManager(store, blockAdapter, Config{})
+	m := NewManager(store, blockAdapter, Config{LocalPath: t.TempDir()})
 
 	ctx := context.Background()
 
-	// Create two COMMITTED packfiles
+	// Create two COMMITTED packfiles on block adapter
 	meta1 := &PackfileMetadata{PackfileId: "hash1", Status: PackfileStatus_COMMITTED, Classification: PackfileClassification_FIRST_CLASS}
 	meta2 := &PackfileMetadata{PackfileId: "hash2", Status: PackfileStatus_COMMITTED, Classification: PackfileClassification_SECOND_CLASS}
 	kv.SetMsg(ctx, store, PackfilesPartition, []byte("packfile:hash1"), meta1)
@@ -1358,7 +1732,7 @@ func TestManager_Merge(t *testing.T) {
 		t.Errorf("merged.Classification = %v, want SECOND_CLASS", merged.Classification)
 	}
 	if len(merged.SourcePackfileIds) != 2 {
-		t.Errorf("len(merged.SourcePackfileIds) = %d, want 2", len(merged.SourcePackfileIds))
+		t.Errorf("len(SourcePackfileIds) = %d, want 2", len(merged.SourcePackfileIds))
 	}
 }
 ```
@@ -1368,23 +1742,36 @@ func TestManager_Merge(t *testing.T) {
 Run: `go test ./pkg/packfile/... -count=1 -v -run TestManager_Merge 2>&1`
 Expected: FAIL — Merge not implemented
 
-- [ ] **Step 3: Implement Merge in manager.go**
+- [ ] **Step 3: Implement Merge and MergeStaged in manager.go**
 
 ```go
-// Merge reads objects from source packfiles, deduplicates, writes new packfile,
-// transitions sources to SUPERSEDED, returns new packfile metadata.
+// MergeStaged merges all STAGED packfiles for a repo into one STAGED packfile.
+// Raw STAGED packfiles are deleted after merge.
+func (m *Manager) MergeStaged(ctx context.Context, repoID string) (*PackfileMetadata, error) {
+	// 1. Read PackfileSnapshot to get all STAGED packfile IDs
+	// 2. For each STAGED packfile:
+	//    a. Open SSTable reader (use index cache)
+	//    b. For each entry, check if content hash already written to new packfile
+	//    c. If not, read object via Unpacker.GetObject, AppendObject to new Packer
+	// 3. On Close(), write SSTable index for new packfile
+	// 4. Atomic rename tmp/ → final location
+	// 5. Update PackfileSnapshot: staged_packfile_ids = [merged_id]
+	// 6. Delete raw STAGED packfile files from block adapter
+	// 7. Return new STAGED PackfileMetadata
+}
+
+// Merge merges source packfiles into a new COMMITTED SECOND_CLASS packfile.
+// Marks source packfiles as SUPERSEDED.
 func (m *Manager) Merge(ctx context.Context, repoID string, sourceIDs []string) (*PackfileMetadata, error) {
-	// 1. Open SSTable readers for all source packfiles
-	// 2. Open new packfile writer (tmp path)
-	// 3. Deduplicate by content hash, write unique objects
-	// 4. Build SSTable index for new packfile
-	// 5. Atomic rename tmp → final path
-	// 6. Update kv: create new PackfileMetadata, mark sources SUPERSEDED
-	// 7. Return new metadata
+	// Similar to MergeStaged but:
+	// - Sources must be COMMITTED
+	// - New packfile is COMMITTED, SECOND_CLASS
+	// - Update snapshot: active_packfile_ids = [new_id]
+	// - Mark sources: SUPERSEDED
 }
 ```
 
-See the design doc Section 4.2 for the full algorithm.
+See design doc Section 4.2 for the full algorithm details.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1397,12 +1784,15 @@ Expected: PASS
 git add pkg/packfile/manager.go pkg/packfile/manager_test.go
 git commit -m "feat(packfile): implement packfile merge
 
+MergeStaged: deduplicates STAGED packfiles → one merged STAGED.
+Merge: deduplicates COMMITTED → one COMMITTED SECOND_CLASS, marks sources SUPERSEDED.
+Both use Packer/Unpacker for streaming read/write.
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 10: Background Cleanup
+### Task 11: Background Cleanup
 
 **Files:**
 - Modify: `pkg/packfile/manager.go` — add CleanupSuperseded, CleanupExpiredUploads
@@ -1416,8 +1806,6 @@ func TestManager_CleanupSuperseded(t *testing.T) {
 	m := NewManager(store, blockAdapter, Config{})
 
 	ctx := context.Background()
-
-	// Create SUPERSEDED packfile with data on "block adapter"
 	kv.SetMsg(ctx, store, PackfilesPartition, []byte("packfile:superseded1"), &PackfileMetadata{
 		PackfileId: "superseded1",
 		Status:    PackfileStatus_SUPERSEDED,
@@ -1428,7 +1816,10 @@ func TestManager_CleanupSuperseded(t *testing.T) {
 		t.Fatalf("CleanupSuperseded error = %v", err)
 	}
 
-	// Verify metadata DELETED and data removed from block adapter
+	meta, _ := m.GetPackfile(ctx, "superseded1")
+	if meta.Status != PackfileStatus_DELETED {
+		t.Errorf("status = %v, want DELETED", meta.Status)
+	}
 }
 
 func TestManager_CleanupExpiredUploads(t *testing.T) {
@@ -1436,10 +1827,9 @@ func TestManager_CleanupExpiredUploads(t *testing.T) {
 	m := NewManager(store, nil, Config{})
 
 	ctx := context.Background()
-	// Create stale upload session (old timestamp)
 	kv.SetMsg(ctx, store, PackfilesPartition, []byte("upload:stale1"), &UploadSession{
-		UploadId:     "stale1",
-		CreatedAt:    &timestamppb.Timestamp{Seconds: 1},
+		UploadId:  "stale1",
+		CreatedAt: &timestamppb.Timestamp{Seconds: 1},
 	})
 
 	err := m.CleanupExpiredUploads(ctx)
@@ -1476,7 +1866,11 @@ func (m *Manager) CleanupSuperseded(ctx context.Context) error {
 		}
 		if meta.Status == PackfileStatus_SUPERSEDED {
 			// Delete data from block adapter
-			m.block.Delete(ctx, block.ObjectPointer{Identifier: packfilePath(meta.PackfileId)})
+			if m.block != nil {
+				m.block.Delete(ctx, block.ObjectPointer{
+					Identifier: packfilePath(meta.PackfileId),
+				})
+			}
 			// Transition to DELETED
 			meta.Status = PackfileStatus_DELETED
 			kv.SetMsg(ctx, m.store, PackfilesPartition, []byte(PackfilePath(meta.PackfileId)), &meta)
@@ -1486,7 +1880,6 @@ func (m *Manager) CleanupSuperseded(ctx context.Context) error {
 }
 
 func (m *Manager) CleanupExpiredUploads(ctx context.Context) error {
-	// Scan Upload sessions, delete any older than TTL
 	const uploadTTL = 24 * time.Hour
 	iter, err := m.store.Scan(ctx, []byte(PackfilesPartition), kv.ScanOptions{})
 	if err != nil {
@@ -1502,7 +1895,9 @@ func (m *Manager) CleanupExpiredUploads(ctx context.Context) error {
 		}
 		if now.After(session.CreatedAt.AsTime().Add(uploadTTL)) {
 			// Delete tmp files
-			os.RemoveAll(session.TmpPath)
+			if session.TmpPath != "" {
+				os.RemoveAll(session.TmpPath)
+			}
 			// Delete kv entry
 			m.store.Delete(ctx, []byte(PackfilesPartition), iter.Entry().Key)
 		}
@@ -1527,9 +1922,9 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ---
 
-## Phase 4: Optimization
+## Phase 3: Optimization
 
-### Task 11: LRU Index Cache
+### Task 12: LRU Index Cache
 
 **Files:**
 - Modify: `pkg/packfile/manager.go` — add LRU cache for open SSTable readers
@@ -1539,14 +1934,14 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```go
 func TestIndexCache(t *testing.T) {
 	cache := NewIndexCache(2)
-	f := &fakeSSTableReader{id: "pf1"}
+	f := &fakeReader{id: "pf1"}
 	cache.Put("pf1", f)
 
 	r, ok := cache.Get("pf1")
 	if !ok {
 		t.Fatal("cache miss for pf1")
 	}
-	if r.(*fakeSSTableReader).id != "pf1" {
+	if r.(*fakeReader).id != "pf1" {
 		t.Error("wrong reader returned")
 	}
 }
@@ -1581,21 +1976,12 @@ func (c *IndexCache) Put(packfileID string, r *sstable.Reader) {
 
 - [ ] **Step 3: Integrate into Manager**
 
-```go
-type Manager struct {
-	store      kv.Store
-	block      block.Adapter
-	config     Config
-	indexCache *IndexCache // LRU cache for open SSTable readers
-}
-```
-
-When reading an object: check L1 cache first → open SSTable if miss → cache.
+When reading an object via Unpacker, check L1 cache first → open SSTable from local disk if miss → cache the reader.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git commit -m "feat(packfile): add LRU index cache
+git commit -m "feat(packfile): add LRU index cache for open SSTable readers
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
@@ -1608,17 +1994,17 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 | Design doc section | Task |
 |--------------------|------|
-| Section 1: Packfile binary format | Task 3 (writer), Task 4 (reader) |
+| Section 1: Packfile binary format | Task 4 (Packer), Task 5 (Unpacker) |
 | Section 1: ContentHash typed type | Task 2 |
 | Section 1: Packfile ID = bare hex SHA-256 | Task 2 |
 | Section 1: KV schema | Task 1 |
-| Section 2: Upload flow | Task 7 (API endpoints) |
-| Section 3: Read flow with SSTable index | Task 5 (index writer), Task 6 (manager), Task 11 (cache) |
-| Section 4: Packfile Manager | Task 6, Task 8 |
+| Section 2: Upload flow | Task 8 (API) |
+| Section 3: Read flow with SSTable index | Task 5 (Unpacker), Task 6 (IndexWriter), Task 12 (cache) |
+| Section 4: Packfile Manager | Task 7, Task 9, Task 10 |
 | Section 5: KV schema | Task 1 |
-| Section 6: Block adapter integration | Task 6 |
+| Section 6: Block adapter integration | Task 7 |
 | Section 8: Error handling | Each task includes error cases |
-| Section 10: Phases 1-4 implementation | Tasks 1-11 |
+| Section 10: Phases 1-4 | Tasks 1-12 |
 
 ### Placeholder scan
 
@@ -1627,15 +2013,19 @@ Result: None found in plan.
 
 ### Type consistency
 
-- `ContentHash.PackfileID()` used consistently in Task 2 onward
-- `PackfileMetadata.Status` uses enum `PackfileStatus_*`
-- `PackfileMetadata.Classification` uses enum `PackfileClassification_*`
+- `ContentHash.PackfileID()` used consistently throughout
+- `PackfileStatus_*` enum used everywhere status is set or checked
+- `PackfileClassification_*` enum used for classification transitions
+- `Compression` constants match `CompressionNone/Zstd/Gzip/LZ4` in `format.go`
 - All kv key helpers (`PackfilePath`, `SnapshotPath`, `UploadPath`) defined in Task 1
+- `IndexEntry` fields match between `index_writer.go` and usage in Manager (Merge)
 
 ### Gaps found
 
-- **Catalog/DBEntry update** — Task 6 should include updating `pkg/catalog/model.go` to add `AddressTypePackfile` and `PackfileOffset` field. Added as a note in Task 6.
-- **Config wiring** — Task 6 should include wiring `Config` into the server's dependency graph in `cmd/lakefs/serve.go`. Added as a note in Task 6.
+- **Catalog/DBEntry update** — Task 8 should include updating `pkg/catalog/model.go` to add `AddressTypePackfile` and `PackfileOffset` field. Added as a note in Task 8.
+- **Config wiring** — Task 7 should include wiring `Config` into the server's dependency graph in `cmd/lakefs/serve.go`. Added as a note in Task 7.
+- **External sort (>= 1M objects)** — Task 6 handles Approach A (in-memory sort). Approach B (file-based merge sort) is deferred to a future task.
+- **Gzip/LZ4 compression support** — `compress.go` only implements `CompressionNone` and `CompressionZstd`. gzip and lz4 are stubs. Added as a note.
 
 ---
 
