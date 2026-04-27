@@ -17,7 +17,7 @@ func (ws *testWriteSeeker) Write(p []byte) (int, error) {
 func (ws *testWriteSeeker) Seek(offset int64, whence int) (int64, error) {
 	switch whence {
 	case io.SeekStart:
-		return 0, nil
+		return offset, nil
 	case io.SeekCurrent:
 		return int64(ws.buf.Len()), nil
 	case io.SeekEnd:

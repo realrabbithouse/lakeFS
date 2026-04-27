@@ -33,6 +33,17 @@ type PackfileObjectIterator interface {
 	Err() error
 	Close() error
 }
+// errorIter is returned by Scan when the packfile is invalid.
+type errorIter struct {
+	err error
+}
+
+func (e *errorIter) Next() bool { return false }
+func (e *errorIter) Object() (ContentHash, int64, int64, int64, io.Reader, error) {
+	return ContentHash{}, 0, 0, 0, nil, e.err
+}
+func (e *errorIter) Err() error { return e.err }
+func (e *errorIter) Close() error { return nil }
 
 // unpacker implements Unpacker.
 type unpacker struct {
@@ -41,6 +52,7 @@ type unpacker struct {
 	compression   Compression
 	footerHasher  hash.Hash // SHA-256 of header + all object data (for integrity check)
 	header        [HeaderSize]byte // loaded packfile header
+	valid         bool // true if magic bytes validated
 }
 
 // NewUnpacker creates an Unpacker from an io.ReadSeeker.
@@ -59,11 +71,27 @@ func NewUnpacker(r io.ReadSeeker) Unpacker {
 		// Will be caught on first operation
 		return u
 	}
+	if string(u.header[:4]) != Magic {
+		// Invalid magic, will fail on first operation
+		return u
+	}
 	u.compression = Compression(u.header[6])
+	u.valid = true
 	return u
 }
 
+// ensureValid returns an error if the packfile magic was invalid.
+func (u *unpacker) ensureValid() error {
+	if !u.valid {
+		return errors.New("invalid packfile: bad magic bytes")
+	}
+	return nil
+}
+
 func (u *unpacker) GetObject(ctx context.Context, offset int64) (ContentHash, io.Reader, int64, int64, error) {
+	if err := u.ensureValid(); err != nil {
+		return ContentHash{}, nil, 0, 0, err
+	}
 	// Read object header at offset
 	var objHdr [40]byte
 	if _, err := u.rat.ReadAt(objHdr[:], offset); err != nil {
@@ -88,6 +116,9 @@ func (u *unpacker) GetObject(ctx context.Context, offset int64) (ContentHash, io
 }
 
 func (u *unpacker) Scan(ctx context.Context, ignoreData bool) PackfileObjectIterator {
+	if err := u.ensureValid(); err != nil {
+		return &errorIter{err: err}
+	}
 	return &scanIter{
 		r:          u.r,
 		compression: u.compression,
@@ -170,10 +201,11 @@ func (it *scanIter) Object() (ContentHash, int64, int64, int64, io.Reader, error
 	pr, pw := io.Pipe()
 	go func() {
 		_, err := io.Copy(pw, io.LimitReader(it.r, it.currentObj.compressedSize))
-		if closeErr := pw.Close(); err == nil {
-			err = closeErr
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("copying compressed data: %w", err))
+			return
 		}
-		_ = err
+		pw.Close()
 	}()
 
 	// Wrap in decompression reader
