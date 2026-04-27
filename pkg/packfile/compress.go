@@ -51,3 +51,52 @@ func UncompressTo(r io.Reader, c Compression, w io.Writer) error {
 		return ErrUnsupportedCompression
 	}
 }
+
+// NewCompressionReader returns a streaming io.Reader that compresses data from r
+// using algorithm c. The caller must close the reader to clean up resources.
+func NewCompressionReader(r io.Reader, c Compression) (io.Reader, error) {
+	switch c {
+	case CompressionNone:
+		return r, nil
+	case CompressionZstd:
+		pr, pw := io.Pipe()
+		go func() {
+			pw.CloseWithError(CompressTo(r, c, pw))
+		}()
+		return pr, nil
+	default:
+		return nil, ErrUnsupportedCompression
+	}
+}
+
+// NewDecompressionReader returns a streaming io.Reader that decompresses data from r
+// using algorithm c. The caller must close the reader to clean up resources.
+func NewDecompressionReader(r io.Reader, c Compression) (io.Reader, error) {
+	switch c {
+	case CompressionNone:
+		return r, nil
+	case CompressionZstd:
+		dec, err := zstd.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		return &zstdReader{dec: dec, r: r}, nil
+	default:
+		return nil, ErrUnsupportedCompression
+	}
+}
+
+// zstdReader wraps a zstd decoder to implement io.ReadCloser.
+type zstdReader struct {
+	dec *zstd.Decoder
+	r   io.Reader
+}
+
+func (z *zstdReader) Read(p []byte) (int, error) {
+	return z.dec.Read(p)
+}
+
+func (z *zstdReader) Close() error {
+	z.dec.Close()
+	return nil
+}
