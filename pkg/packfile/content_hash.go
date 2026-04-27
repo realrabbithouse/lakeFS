@@ -43,6 +43,16 @@ func (h ContentHash) Equal(other ContentHash) bool {
 	return h == other
 }
 
+// BigThan returns true if h > other (lexicographic comparison).
+func (h ContentHash) BigThan(other ContentHash) bool {
+	for i := range h {
+		if h[i] != other[i] {
+			return h[i] > other[i]
+		}
+	}
+	return false
+}
+
 // StreamingHash computes a ContentHash incrementally as data is written.
 // Use during AppendObject to hash as data streams in.
 type StreamingHash struct {
