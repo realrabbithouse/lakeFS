@@ -1,0 +1,48 @@
+syntax = "proto3";
+package packfile;
+option go_package = "github.com/treeverse/lakefs/pkg/packfile";
+
+import "google/protobuf/timestamp.proto";
+
+enum PackfileStatus {
+  STAGED = 0;
+  COMMITTED = 1;
+  SUPERSEDED = 2;
+  DELETED = 3;
+}
+
+enum PackfileClassification {
+  SECOND_CLASS = 0;
+  FIRST_CLASS = 1;
+}
+
+message PackfileMetadata {
+  string packfile_id = 1;
+  PackfileStatus status = 2;
+  PackfileClassification classification = 3;
+  string repository_id = 4;
+  string storage_namespace = 5;
+  int64 object_count = 6;
+  int64 size_bytes = 7;
+  int64 size_bytes_compressed = 8;
+  string compression_algorithm = 9;
+  string checksum_algorithm = 10;
+  google.protobuf.Timestamp created_at = 11;
+  repeated string source_packfile_ids = 12;
+}
+
+message PackfileSnapshot {
+  string repository_id = 1;
+  repeated string active_packfile_ids = 2;
+  repeated string staged_packfile_ids = 3;
+  google.protobuf.Timestamp last_commit_at = 4;
+  google.protobuf.Timestamp last_merge_at = 5;
+}
+
+message UploadSession {
+  string upload_id = 1;
+  string packfile_id = 2;
+  string repository_id = 3;
+  string tmp_path = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
