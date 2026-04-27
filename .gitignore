@@ -86,3 +86,6 @@ target/
 .opencode/
 _bmad-output/
 _bmad/
+
+# Git worktrees
+.worktrees/
