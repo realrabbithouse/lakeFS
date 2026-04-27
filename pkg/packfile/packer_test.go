@@ -8,8 +8,8 @@ import (
 )
 
 func TestPacker_AppendObject(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 
 	obj := []byte("hello world")
 	r := bytes.NewReader(obj)
@@ -28,8 +28,8 @@ func TestPacker_AppendObject(t *testing.T) {
 }
 
 func TestPacker_Close(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 
 	// Append two objects (size=5 for "hello", size=5 for "world")
 	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")), 5)
@@ -39,15 +39,15 @@ func TestPacker_Close(t *testing.T) {
 		t.Fatalf("Close error = %v", err)
 	}
 
-	data := buf.Bytes()
+	data := ws.bytes()
 	if string(data[:4]) != "LKP1" {
 		t.Errorf("magic = %q, want LKP1", data[:4])
 	}
 }
 
 func TestPacker_Close_Idempotent(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")), 5)
 	p.Close()
 	err := p.Close()
@@ -57,8 +57,8 @@ func TestPacker_Close_Idempotent(t *testing.T) {
 }
 
 func TestPacker_AppendObject_Closed(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 	p.Close()
 	_, _, err := p.AppendObject(context.Background(), bytes.NewReader([]byte("x")), 1)
 	if err == nil {
@@ -67,8 +67,8 @@ func TestPacker_AppendObject_Closed(t *testing.T) {
 }
 
 func TestPacker_MultipleObjects(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 
 	objs := []struct {
 		data string
@@ -96,7 +96,7 @@ func TestPacker_MultipleObjects(t *testing.T) {
 		t.Fatalf("Close error = %v", err)
 	}
 
-	data := buf.Bytes()
+	data := ws.bytes()
 	// Verify footer (last 32 bytes) is SHA-256 of everything before it
 	footer := data[len(data)-32:]
 	if len(footer) != 32 {
@@ -105,8 +105,8 @@ func TestPacker_MultipleObjects(t *testing.T) {
 }
 
 func TestPacker_AppendObject_WithZstd(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionZstd, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionZstd, ClassificationSecondClass)
 
 	data := bytes.Repeat([]byte("hello world "), 100)
 	r := bytes.NewReader(data)
@@ -127,15 +127,15 @@ func TestPacker_AppendObject_WithZstd(t *testing.T) {
 	p.Close()
 
 	// Verify packfile ends with footer
-	contents := buf.Bytes()
+	contents := ws.bytes()
 	if len(contents) < 40+int(compressedSize)+32 {
 		t.Errorf("packfile too short: %d", len(contents))
 	}
 }
 
 func TestPacker_AppendObject_Empty(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 
 	_, _, err := p.AppendObject(context.Background(), bytes.NewReader([]byte{}), 0)
 	if err != nil {
@@ -145,8 +145,8 @@ func TestPacker_AppendObject_Empty(t *testing.T) {
 }
 
 func TestPacker_ReadBack(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 
 	original := []byte("hello world packfile test data")
 	offset, _, err := p.AppendObject(context.Background(), bytes.NewReader(original), int64(len(original)))
@@ -156,8 +156,8 @@ func TestPacker_ReadBack(t *testing.T) {
 	p.Close()
 
 	// Read it back using Unpacker
-	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
-	r, size, _, err := u.GetObject(context.Background(), offset)
+	u := NewUnpacker(bytes.NewReader(ws.bytes()))
+	_, r, size, _, err := u.GetObject(context.Background(), offset)
 	if err != nil {
 		t.Fatalf("GetObject error = %v", err)
 	}

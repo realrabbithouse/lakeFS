@@ -22,11 +22,11 @@ type Packer interface {
 
 // packer implements Packer.
 type packer struct {
-	w              io.Writer
+	w              io.WriteSeeker
 	compression    Compression
 	classification Classification
 	footerHasher   hash.Hash       // SHA-256 of header + all object data (for footer checksum)
-	contentHasher  *StreamingHash  // per-object content hash via streaming
+	contentHasher *StreamingHash // per-object content hash via streaming
 
 	objectCount            uint64
 	totalSizeUncompressed uint64
@@ -35,7 +35,7 @@ type packer struct {
 }
 
 // NewPacker creates a Packer that writes to w.
-func NewPacker(w io.Writer, compression Compression, classification Classification) Packer {
+func NewPacker(w io.WriteSeeker, compression Compression, classification Classification) Packer {
 	p := &packer{
 		w:              w,
 		compression:    compression,
@@ -131,12 +131,20 @@ func (p *packer) Close() error {
 	h.Write(p.footerHasher.Sum(nil))
 	checksum := h.Sum(nil)
 
-	// Write updated header and footer
+	// Seek to start and write updated header
+	if _, err := p.w.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seeking to start: %w", err)
+	}
 	if _, err := p.w.Write(finalHeader[:]); err != nil {
-		return err
+		return fmt.Errorf("writing updated header: %w", err)
+	}
+
+	// Seek to end and write footer checksum
+	if _, err := p.w.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seeking to end: %w", err)
 	}
 	if _, err := p.w.Write(checksum); err != nil {
-		return err
+		return fmt.Errorf("writing footer: %w", err)
 	}
 
 	return nil

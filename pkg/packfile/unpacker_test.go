@@ -9,8 +9,8 @@ import (
 
 func TestUnpacker_GetObject(t *testing.T) {
 	// Build a packfile with one object
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 	data := []byte("hello world")
 	offset, _, err := p.AppendObject(context.Background(), bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -19,10 +19,13 @@ func TestUnpacker_GetObject(t *testing.T) {
 	p.Close()
 
 	// Read it back
-	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
-	r, size, compressedSize, err := u.GetObject(context.Background(), offset)
+	u := NewUnpacker(bytes.NewReader(ws.bytes()))
+	h, r, size, compressedSize, err := u.GetObject(context.Background(), offset)
 	if err != nil {
 		t.Fatalf("GetObject error = %v", err)
+	}
+	if h == (ContentHash{}) {
+		t.Error("content hash is zero")
 	}
 
 	got, err := io.ReadAll(r)
@@ -41,20 +44,20 @@ func TestUnpacker_GetObject(t *testing.T) {
 }
 
 func TestUnpacker_Scan(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")), 5)
 	p.AppendObject(context.Background(), bytes.NewReader([]byte("world")), 5)
 	p.Close()
 
-	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
-	iter := u.Scan(context.Background())
+	u := NewUnpacker(bytes.NewReader(ws.bytes()))
+	iter := u.Scan(context.Background(), false)
 	defer iter.Close()
 
 	cnt := 0
 	var contents []string
 	for iter.Next() {
-		_, _, _, r, err := iter.Object()
+		_, _, _, _, r, err := iter.Object()
 		if err != nil {
 			t.Fatalf("iter.Object error = %v", err)
 		}
@@ -71,8 +74,8 @@ func TestUnpacker_Scan(t *testing.T) {
 }
 
 func TestUnpacker_GetObject_Zstd(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionZstd, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionZstd, ClassificationSecondClass)
 	data := bytes.Repeat([]byte("hello world "), 100)
 	offset, _, err := p.AppendObject(context.Background(), bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -80,8 +83,8 @@ func TestUnpacker_GetObject_Zstd(t *testing.T) {
 	}
 	p.Close()
 
-	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
-	r, size, _, err := u.GetObject(context.Background(), offset)
+	u := NewUnpacker(bytes.NewReader(ws.bytes()))
+	_, r, size, _, err := u.GetObject(context.Background(), offset)
 	if err != nil {
 		t.Fatalf("GetObject error = %v", err)
 	}
@@ -99,12 +102,12 @@ func TestUnpacker_GetObject_Zstd(t *testing.T) {
 }
 
 func TestUnpacker_Scan_Empty(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 	p.Close()
 
-	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
-	iter := u.Scan(context.Background())
+	u := NewUnpacker(bytes.NewReader(ws.bytes()))
+	iter := u.Scan(context.Background(), false)
 	defer iter.Close()
 
 	cnt := 0
@@ -118,15 +121,15 @@ func TestUnpacker_Scan_Empty(t *testing.T) {
 
 func TestUnpacker_GetObject_InvalidOffset(t *testing.T) {
 	u := NewUnpacker(bytes.NewReader([]byte{}))
-	_, _, _, err := u.GetObject(context.Background(), 100)
+	_, _, _, _, err := u.GetObject(context.Background(), 100)
 	if err == nil {
 		t.Error("expected error for invalid offset")
 	}
 }
 
 func TestUnpacker_Scan_MultipleObjects(t *testing.T) {
-	var buf bytes.Buffer
-	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
 
 	objs := []string{"a", "bc", "def", "xyzw"}
 	for _, s := range objs {
@@ -134,13 +137,13 @@ func TestUnpacker_Scan_MultipleObjects(t *testing.T) {
 	}
 	p.Close()
 
-	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
-	iter := u.Scan(context.Background())
+	u := NewUnpacker(bytes.NewReader(ws.bytes()))
+	iter := u.Scan(context.Background(), false)
 	defer iter.Close()
 
 	var contents []string
 	for iter.Next() {
-		_, _, _, r, err := iter.Object()
+		_, _, _, _, r, err := iter.Object()
 		if err != nil {
 			t.Fatalf("iter.Object error = %v", err)
 		}
@@ -155,5 +158,43 @@ func TestUnpacker_Scan_MultipleObjects(t *testing.T) {
 		if contents[i] != s {
 			t.Errorf("contents[%d] = %q, want %q", i, contents[i], s)
 		}
+	}
+}
+
+func TestUnpacker_Scan_IgnoreData(t *testing.T) {
+	ws := newTestWriteSeeker()
+	p := NewPacker(ws, CompressionNone, ClassificationSecondClass)
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")), 5)
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("world")), 5)
+	p.Close()
+
+	u := NewUnpacker(bytes.NewReader(ws.bytes()))
+	iter := u.Scan(context.Background(), true) // ignoreData=true
+	defer iter.Close()
+
+	cnt := 0
+	var hashes []ContentHash
+	for iter.Next() {
+		h, _, size, compressedSize, r, err := iter.Object()
+		if err != nil {
+			t.Fatalf("iter.Object error = %v", err)
+		}
+		if r != nil {
+			t.Error("expected nil reader when ignoreData=true")
+		}
+		if size != 5 {
+			t.Errorf("size = %d, want 5", size)
+		}
+		if compressedSize != 5 {
+			t.Errorf("compressedSize = %d, want 5", compressedSize)
+		}
+		hashes = append(hashes, h)
+		cnt++
+	}
+	if cnt != 2 {
+		t.Errorf("count = %d, want 2", cnt)
+	}
+	if len(hashes) != 2 || hashes[0] == (ContentHash{}) || hashes[1] == (ContentHash{}) {
+		t.Errorf("hashes not populated correctly")
 	}
 }
