@@ -64,6 +64,7 @@ Uploading or downloading many small objects in lakeFS is inefficient because eac
 - **Classification**: First-class (0x01) packfiles are COMMITTED and protected from deletion during merge. Second-class (0x02) packfiles are STAGED or merged, eligible for GC when new packfile is built
 - **Packfile ID** is the bare hex SHA-256 content hash of the packfile (no algorithm prefix). Client knows the packfile ID before uploading, enabling deduplication
 - New objects cannot be appended to an existing packfile; instead, create a new packfile and merge later
+- **Streaming IO trade-off**: The packfile format writes each object's 40-byte header before the compressed data, because the header contains `compressedSize`. Since compression is not seekable (compressor must consume all input before emitting output), the compressed output for an object must be fully materialized before the header can be written. This is the only place that violates true streaming IO. Mitigation: compressed output is buffered per-object only (max 5MB), not unbounded. All bulk data still streams — the `Packer` writes in one `Write()` call per object after buffering. This is acceptable because max object size (5MB) ≪ max packfile size (5GB).
 
 ### 1.2 Index File (`.sst`)
 
@@ -197,21 +198,15 @@ type DBEntry struct {
 // For packfiles, the ContentHash IS the packfile_id (content-addressed).
 type ContentHash [32]byte
 
-// PackfileID returns the content hash as a bare hex string (no prefix).
-// This value IS the packfile_id used in storage paths and KV keys.
-func (h ContentHash) PackfileID() string {
+// String returns the content hash as lowercase hex string.
+// packfile_id = bare hex string via fmt.Sprintf("%x", h[:])
+func (h ContentHash) String() string {
     return fmt.Sprintf("%x", h[:])
 }
 
-// String returns the content hash as lowercase hex string (no prefix)
-func (h ContentHash) String() string {
-    return h.PackfileID()
-}
-
-// ParseContentHash parses a content hash string.
-// Accepts both "sha256:..." format (legacy) and plain "..." format.
+// ParseContentHash parses a bare hex content hash string (64 hex chars).
 func ParseContentHash(s string) (ContentHash, error) {
-    // strip "sha256:" prefix if present, decode hex to [32]byte
+    // decode 64 hex chars to [32]byte
 }
 
 // Bytes returns the raw 32-byte hash
@@ -223,13 +218,20 @@ func (h ContentHash) Bytes() []byte {
 func (h ContentHash) Equal(other ContentHash) bool {
     return h == other
 }
+
+// StreamingHash computes a ContentHash incrementally as data is read.
+// Used during AppendObject to hash as data streams in.
+type StreamingHash struct{ h hash.Hash }
+func NewStreamingHash() *StreamingHash
+func (sh *StreamingHash) Write(p []byte) (int, error)
+func (sh *StreamingHash) Sum() ContentHash
 ```
 
 **Why a typed type:**
 - Compile-time type safety prevents accidentally passing `[32]byte` where `ContentHash` expected
-- Methods like `String()` and `Parse()` handle hex encoding (no "sha256:" prefix)
+- `String()` returns bare hex (no prefix) — this value IS the packfile_id
 - Clear semantic intent: this is a content address, not just arbitrary bytes
-- `PackfileID()` makes the content-addressed identity explicit
+- `StreamingHash` enables incremental content hash computation during streaming IO
 
 **Staging manager integration:**
 
