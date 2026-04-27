@@ -2,7 +2,6 @@ package packfile
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/cockroachdb/pebble/sstable"
 	lru "github.com/hnlq715/golang-lru"
@@ -11,9 +10,7 @@ import (
 // IndexCache provides LRU caching of open SSTable readers for packfile indices.
 // It avoids repeated file opens and SSTable parsing when accessing the same packfile's index.
 type IndexCache struct {
-	cache   *lru.Cache
-	readers map[string]*sstable.Reader
-	mu      sync.Mutex
+	cache *lru.Cache
 }
 
 // NewIndexCache creates a new index cache with the specified maximum number of entries.
@@ -21,10 +18,6 @@ type IndexCache struct {
 func NewIndexCache(maxEntries int) (*IndexCache, error) {
 	if maxEntries <= 0 {
 		return nil, fmt.Errorf("max entries must be positive, got %d", maxEntries)
-	}
-
-	c := &IndexCache{
-		readers: make(map[string]*sstable.Reader),
 	}
 
 	evictedFunc := func(k, v interface{}) {
@@ -37,9 +30,7 @@ func NewIndexCache(maxEntries int) (*IndexCache, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating LRU cache: %w", err)
 	}
-	c.cache = cache
-
-	return c, nil
+	return &IndexCache{cache: cache}, nil
 }
 
 // Get returns an open SSTable reader for the given packfile ID, or nil if not cached.
@@ -68,9 +59,6 @@ func (c *IndexCache) Close() error {
 	if c == nil || c.cache == nil {
 		return nil
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	c.cache.Purge()
 	return nil

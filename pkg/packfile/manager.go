@@ -311,12 +311,15 @@ func (m *Manager) Merge(ctx context.Context, repoID string, sourceIDs []string) 
 		return nil, errors.New("no source packfiles provided")
 	}
 
-	// Fetch source packfile metadata
+	// Fetch source packfile metadata and validate they are COMMITTED
 	var sources []*PackfileMetadata
 	for _, id := range sourceIDs {
 		meta, err := m.GetPackfile(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("getting source packfile %s: %w", id, err)
+		}
+		if meta.Status != PackfileStatus_COMMITTED {
+			return nil, fmt.Errorf("source packfile %s is not COMMITTED (status=%v)", id, meta.Status)
 		}
 		sources = append(sources, meta)
 	}
