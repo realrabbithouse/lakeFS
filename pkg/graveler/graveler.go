@@ -45,6 +45,16 @@ type GravelerConfig struct {
 	ProtectedBranchesManager ProtectedBranchesManager
 	DeleteSensor             *DeleteSensor
 	WorkPool                 pond.Pool
+	// PackfileManager handles packfile merge and commit during graveler commits.
+	// If nil, packfile flow is disabled.
+	PackfileManager PackfileManager
+}
+
+// PackfileManager defines the interface for packfile operations during commit.
+// See docs/superpowers/specs/2026-04-16-packfile-implementation-design.md Section 4.2.
+type PackfileManager interface {
+	MergeStaged(ctx context.Context, repoID string) error
+	Commit(ctx context.Context, repoID string) error
 }
 
 //go:generate go run github.com/golang/mock/mockgen@v1.6.0 -source=graveler.go -destination=mock/graveler.go -package=mock
@@ -1226,6 +1236,7 @@ type Graveler struct {
 	BranchUpdateBackOff backoff.BackOff
 	deleteSensor        *DeleteSensor
 	workPool            pond.Pool
+	packfileManager     PackfileManager
 }
 
 func NewGraveler(cfg GravelerConfig) *Graveler {
@@ -1249,6 +1260,7 @@ func NewGraveler(cfg GravelerConfig) *Graveler {
 		logger:                   logging.ContextUnavailable().WithField("service_name", "graveler_graveler"),
 		deleteSensor:             cfg.DeleteSensor,
 		workPool:                 workPool,
+		packfileManager:          cfg.PackfileManager,
 	}
 }
 
@@ -2339,6 +2351,16 @@ func (g *Graveler) Commit(ctx context.Context, repository *RepositoryRecord, bra
 			parentGeneration = int32(branchCommit.Generation)
 		}
 		commit.Generation = CommitGeneration(parentGeneration + 1)
+
+		// Step 1: Merge staged packfiles before commit (per design doc Section 4.2)
+		// This reads all STAGED packfiles, deduplicates, writes one merged STAGED packfile,
+		// updates PackfileSnapshot.staged_packfile_ids. If packfileManager is nil, skip.
+		if g.packfileManager != nil {
+			if err := g.packfileManager.MergeStaged(ctx, string(repository.RepositoryID)); err != nil {
+				return nil, fmt.Errorf("merge staged packfiles: %w", err)
+			}
+		}
+
 		if params.SourceMetaRange != nil {
 			empty, err := g.isSealedEmpty(ctx, repository, branch)
 			if err != nil {
@@ -2382,6 +2404,15 @@ func (g *Graveler) Commit(ctx context.Context, repository *RepositoryRecord, bra
 	}
 
 	g.dropTokens(ctx, sealedToDrop...)
+
+	// Step 3: Transition merged STAGED → COMMITTED (per design doc Section 4.2)
+	// If packfileManager is nil, skip. Errors are logged but don't fail the commit
+	// since packfile transition can be retried later.
+	if g.packfileManager != nil {
+		if err := g.packfileManager.Commit(ctx, string(repository.RepositoryID)); err != nil {
+			g.log(ctx).WithError(err).Error("packfile commit failed")
+		}
+	}
 
 	if !repository.ReadOnly {
 		postRunID := g.hooks.NewRunID()
