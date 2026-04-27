@@ -1,7 +1,6 @@
 package packfile
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -411,24 +410,16 @@ func (m *Manager) mergePackfiles(ctx context.Context, sources []*PackfileMetadat
 		iter := unpacker.Scan(ctx, false)
 
 		for iter.Next() {
-			_, offset, uncompressedSize, _, _, err := iter.Object()
+			// Use iter.Object() directly - it returns the decompressed reader
+			_, _, uncompressedSize, _, objReader, err := iter.Object()
 			if err != nil {
 				iter.Close()
 				reader.Close()
 				packer.Close()
-				return nil, fmt.Errorf("reading object from %s at offset %d: %w", src.PackfileId, offset, err)
+				return nil, fmt.Errorf("reading object from %s: %w", src.PackfileId, err)
 			}
 
-			// Re-read the specific object using GetObject for the actual data
-			_, reReader, _, _, err := unpacker.GetObject(ctx, offset)
-			if err != nil {
-				iter.Close()
-				reader.Close()
-				packer.Close()
-				return nil, fmt.Errorf("re-reading object at offset %d: %w", offset, err)
-			}
-
-			_, _, err = packer.AppendObject(ctx, reReader, uncompressedSize)
+			_, _, err = packer.AppendObject(ctx, objReader, uncompressedSize)
 			if err != nil {
 				iter.Close()
 				reader.Close()
@@ -454,29 +445,29 @@ func (m *Manager) mergePackfiles(ctx context.Context, sources []*PackfileMetadat
 		return nil, fmt.Errorf("closing packer: %w", err)
 	}
 
-	// Seek to beginning to read merged data
+	// Seek to beginning to stream merged data directly to block storage
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seeking temp file: %w", err)
 	}
 
-	mergedData, err := io.ReadAll(f)
+	// Get file size
+	info, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("reading merged data: %w", err)
+		return nil, fmt.Errorf("stat temp file: %w", err)
 	}
+	actualSize := info.Size()
 
-	// Upload merged packfile to block storage
+	// Upload merged packfile to block storage (streaming, no in-memory buffer)
 	storageID := m.config.StorageNamespace
 	obj := block.ObjectPointer{
 		StorageNamespace: storageID,
 		Identifier:       newPackfileID,
 		IdentifierType:   block.IdentifierTypeRelative,
 	}
-	_, err = m.block.Put(ctx, obj, int64(len(mergedData)), bytes.NewReader(mergedData), block.PutOpts{})
+	_, err = m.block.Put(ctx, obj, actualSize, f, block.PutOpts{})
 	if err != nil {
 		return nil, fmt.Errorf("uploading merged packfile: %w", err)
 	}
-
-	sizeCompressed := int64(len(mergedData))
 
 	// Create source packfile IDs list
 	sourceIDs := make([]string, len(sources))
@@ -498,7 +489,7 @@ func (m *Manager) mergePackfiles(ctx context.Context, sources []*PackfileMetadat
 		StorageNamespace:      storageID,
 		ObjectCount:          totalObjectCount,
 		SizeBytes:            totalSizeUncompressed,
-		SizeBytesCompressed:  sizeCompressed,
+		SizeBytesCompressed:  actualSize,
 		CompressionAlgorithm: "zstd",
 		ChecksumAlgorithm:     "sha256",
 		CreatedAt:             timestamppb.Now(),
