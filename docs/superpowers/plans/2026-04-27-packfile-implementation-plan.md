@@ -888,7 +888,7 @@ func TestUnpacker_GetObject(t *testing.T) {
 	var buf bytes.Buffer
 	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
 	data := []byte("hello world")
-	offset, _, _, err := p.AppendObject(context.Background(), bytes.NewReader(data))
+	offset, _, err := p.AppendObject(context.Background(), bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("AppendObject error = %v", err)
 	}
@@ -919,8 +919,8 @@ func TestUnpacker_GetObject(t *testing.T) {
 func TestUnpacker_Scan(t *testing.T) {
 	var buf bytes.Buffer
 	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
-	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")))
-	p.AppendObject(context.Background(), bytes.NewReader([]byte("world")))
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")), 5)
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("world")), 5)
 	p.Close()
 
 	u := NewUnpacker(bytes.NewReader(buf.Bytes()))
@@ -1448,7 +1448,9 @@ package packfile
 import (
 	"context"
 	"errors"
+	"time"
 
+	"github.com/oklog/ulid/v2"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -1471,7 +1473,7 @@ func NewManager(store kv.Store, blockAdapter block.Adapter, cfg Config) *Manager
 
 func (m *Manager) CreateUploadSession(ctx context.Context, repoID, packfileID string) (*UploadSession, error) {
 	session := &UploadSession{
-		UploadId:     packfileID[:20], // TODO: use ULID
+		UploadId:     ulid.Make().String(),
 		PackfileId:   packfileID,
 		RepositoryId: repoID,
 		CreatedAt:    timestamppb.Now(),
