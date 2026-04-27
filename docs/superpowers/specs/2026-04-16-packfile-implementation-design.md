@@ -98,43 +98,26 @@ The index file provides all metadata needed for random access. It is the **only*
 
 #### Solution 2: SSTable-Style Index (preferred, only solution implemented)
 
-SSTable (Sorted String Table) is already used by lakeFS's Graveler for range and metarange storage. Using the same structure for packfile indices provides better integration and easier maintenance.
+The index is stored as an SSTable using `github.com/cockroachdb/pebble/sstable`. This is the same format used by lakeFS's Graveler for range and metarange storage.
 
-**Structure:**
-```
-┌─────────────────────────────────────────────────────────┐
-│ Index Block (compressed)                               │
-│   Key: Content Hash (32 bytes)                         │
-│   Value: { offset, size_uncompressed, size_compressed }│
-│   Block size: 32KB (configurable)                     │
-│   Compression: same as packfile                        │
-├─────────────────────────────────────────────────────────┤
-│ Filter Block (Bloom filter)                            │
-│   Per-block bloom filter for fast negative lookups    │
-├─────────────────────────────────────────────────────────┤
-│ Index Footer (12 bytes)                                │
-│   Magic: "LKSI" (4 bytes)                             │
-│   Offset to Index Block: varint                        │
-│   Offset to Filter Block: varint                       │
-│   Checksum (32 bytes)                                  │
-└─────────────────────────────────────────────────────────┘
-```
+**Index entry:**
+- Key: Content Hash (32 bytes)
+- Value: three varints — `offset`, `size_uncompressed`, `size_compressed`
 
-**Why SSTable is preferred:**
-1. Graveler already uses Pebble's SSTable implementation — shared code and tooling
-2. Bloom filter provides O(1) fast negative lookups (object not in packfile)
-3. Block-level compression reduces index size significantly
-4. SSTable building and merging is well-understood and efficient
-5. Can use `github.com/cockroachdb/pebble/sstable` package directly
+**Properties used:**
+- Bloom filter for O(1) fast negative lookups (object not in packfile)
+- Block-level compression (same algorithm as packfile)
+- 32KB block size (configurable)
+
+The pebble/sstable package handles all internal structure (index blocks, filter blocks, footer). Implementation uses it directly.
 
 **Implementation:** Only Solution 2 (SSTable) will be implemented. Solution 1 is documented for reference.
 
 **Why separate index file?**
 - Packfile stays simple (append-only stream)
-- Index can be memory-mapped without loading packfile data
 - SSTable index is block-compressed, very compact
 - Bloom filter enables fast negative lookups
-- Graveler's existing Pebble/SSTable infrastructure can be reused
+- Graveler's existing Pebble/SSTable infrastructure is reused
 
 ### 1.3 Storage Path
 
