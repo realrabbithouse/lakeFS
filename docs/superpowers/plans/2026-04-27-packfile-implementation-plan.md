@@ -4,7 +4,7 @@
 
 **Goal:** Implement the packfile transfer protocol — a streaming binary bundle format for bulk object upload/download with content-addressable deduplication, SSTable indexing, and packfile merge.
 
-**Architecture:** Packfiles are immutable binary bundles of compressed objects stored on local disk/NFS (primary) with async S3 backup. An SSTable index provides O(1) bloom-filter-accelerated lookups by content hash. Packfile Manager is the single authority for all packfile metadata state; Graveler is its client. The packfile binary format uses Packer (append-only writer) and Unpacker (random+sequential access) abstractions with true streaming IO throughout.
+**Architecture:** Packfiles are immutable binary bundles of compressed objects stored on local disk/NFS (primary) with async S3 backup. An SSTable index provides O(1) bloom-filter-accelerated lookups by content hash. Packfile Manager is the single authority for all packfile metadata state; Graveler is its client. The packfile binary format uses Packer (append-only writer) and Unpacker (random+sequential access) abstractions. True streaming IO throughout except per-object: the header-before-data format requires materializing compressed output to know `compressedSize` before writing the header — bounded per-object buffer (max 5MB).
 
 **Tech Stack:** Go, `github.com/cockroachdb/pebble/sstable`, `github.com/google/uuid`, block adapter (S3/GCS/Azure/Local)
 
@@ -90,10 +90,13 @@ func UncompressTo(r io.Reader, c Compression, w io.Writer) error
 // Packer builds a packfile. Append-only, Close() writes footer checksum.
 type Packer interface {
     // AppendObject appends one object to the packfile.
-    // Internally uses CompressTo for streaming compression.
-    // Internally uses StreamingHash to compute content hash as data is read.
-    // Returns (offset, compressedSize, uncompressedSize).
-    AppendObject(ctx context.Context, r io.Reader) (offset, compressedSize, uncompressedSize int64, err error)
+    // r: raw (uncompressed) object data stream
+    // uncompressedSize: known size of the raw object (must be provided by caller).
+    //   Content hash is computed via StreamingHash as data streams through.
+    //   Compressed output is buffered per-object (max 5MB) to get compressedSize
+    //   before writing the object header — the ONE non-streaming trade-off.
+    // Returns (offset, compressedSize).
+    AppendObject(ctx context.Context, r io.Reader, uncompressedSize int64) (offset, compressedSize int64, err error)
     Close() error
 }
 ```
@@ -635,7 +638,7 @@ func TestPacker_AppendObject(t *testing.T) {
 	obj := []byte("hello world")
 	r := bytes.NewReader(obj)
 
-	offset, compressedSize, uncompressedSize, err := p.AppendObject(context.Background(), r)
+	offset, compressedSize, err := p.AppendObject(context.Background(), r, int64(len(obj)))
 	if err != nil {
 		t.Fatalf("AppendObject error = %v", err)
 	}
@@ -646,18 +649,15 @@ func TestPacker_AppendObject(t *testing.T) {
 	if compressedSize != int64(len(obj)) {
 		t.Errorf("compressedSize = %d, want %d", compressedSize, len(obj))
 	}
-	if uncompressedSize != int64(len(obj)) {
-		t.Errorf("uncompressedSize = %d, want %d", uncompressedSize, len(obj))
-	}
 }
 
 func TestPacker_Close(t *testing.T) {
 	var buf bytes.Buffer
 	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
 
-	// Append two objects
-	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")))
-	p.AppendObject(context.Background(), bytes.NewReader([]byte("world")))
+	// Append two objects (size=5 for "hello", size=5 for "world")
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")), 5)
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("world")), 5)
 
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close error = %v", err)
@@ -672,7 +672,7 @@ func TestPacker_Close(t *testing.T) {
 func TestPacker_Close_Idempotent(t *testing.T) {
 	var buf bytes.Buffer
 	p := NewPacker(&buf, CompressionNone, ClassificationSecondClass)
-	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")))
+	p.AppendObject(context.Background(), bytes.NewReader([]byte("hello")), 5)
 	p.Close()
 	err := p.Close()
 	if err == nil {
@@ -740,17 +740,21 @@ import (
 
 // Packer builds a packfile. Append-only, Close() writes footer checksum.
 type Packer interface {
-	AppendObject(ctx context.Context, r io.Reader) (offset, compressedSize, uncompressedSize int64, err error)
+	// AppendObject appends one object to the packfile.
+	// uncompressedSize must be provided by caller (e.g., from file stats).
+	// Content hash is computed via StreamingHash as data streams through.
+	// Compressed output is buffered per-object (max 5MB) — ONE non-streaming trade-off.
+	AppendObject(ctx context.Context, r io.Reader, uncompressedSize int64) (offset, compressedSize int64, err error)
 	Close() error
 }
 
 // packer implements Packer.
 type packer struct {
-	w             io.Writer
-	compression   Compression
+	w              io.Writer
+	compression    Compression
 	classification Classification
-	footerHasher  hash.Hash    // SHA-256 of header + all object data (for footer checksum)
-	contentHasher *StreamingHash // per-object content hash via streaming
+	footerHasher   hash.Hash       // SHA-256 of header + all object data (for footer checksum)
+	contentHasher  *StreamingHash  // per-object content hash via streaming
 
 	objectCount            uint64
 	totalSizeUncompressed uint64
@@ -769,34 +773,32 @@ func NewPacker(w io.Writer, compression Compression, classification Classificati
 	}
 }
 
-func (p *packer) AppendObject(ctx context.Context, r io.Reader) (int64, int64, int64, error) {
+func (p *packer) AppendObject(ctx context.Context, r io.Reader, uncompressedSize int64) (int64, int64, error) {
 	if p.closed {
-		return 0, 0, 0, errors.New("packer closed")
+		return 0, 0, errors.New("packer closed")
 	}
 
-	// True streaming: read input, hash with StreamingHash for content addr,
-	// simultaneously feed into compressor, capture compressed size.
-	// Never buffers full object in memory — uses io.Pipe for compression.
+	// Streaming: feed input into StreamingHash via TeeReader for content addr,
+	// and into compressor via io.Pipe. The compressed output must be fully
+	// materialized to get compressedSize before writing the header.
+	// ONE non-streaming trade-off: per-object compressed buffer (max 5MB).
+	// This is acceptable since max object (5MB) << max packfile (5GB).
 
 	reader := io.TeeReader(r, p.contentHasher)
 
-	// Compress via streaming pipe — compressedData buffered per-object (max 5MB)
 	pr, pw := io.Pipe()
 	go func() {
-		// pw closes when CompressTo completes (or errors)
 		pw.CloseWithError(CompressTo(reader, p.compression, pw))
 	}()
 
-	// Read compressed data to capture size and write to packfile
 	compressedData, err := io.ReadAll(pr)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("compress object: %w", err)
+		return 0, 0, fmt.Errorf("compress object: %w", err)
 	}
 
-	contentHash := p.contentHasher.Sum()   // get content hash before reset
-	p.contentHasher = NewStreamingHash() // reset for next object
+	contentHash := p.contentHasher.Sum()
+	p.contentHasher = NewStreamingHash()
 
-	uncompressedSize := int64(len(compressedData)) // not tracked per-object without reading input twice
 	compressedSize := int64(len(compressedData))
 
 	// Record offset (current position in packfile = header + all previous objects)
@@ -810,12 +812,12 @@ func (p *packer) AppendObject(ctx context.Context, r io.Reader) (int64, int64, i
 
 	// Write to underlying writer AND update footer hasher
 	if _, err := p.w.Write(objHdr[:]); err != nil {
-		return 0, 0, 0, err
+		return 0, 0, err
 	}
 	p.footerHasher.Write(objHdr[:])
 
-	if _, err := p.w.Write(compressedData); err != nil {
-		return 0, 0, 0, err
+		if _, err := p.w.Write(compressedData); err != nil {
+		return 0, 0, err
 	}
 	p.footerHasher.Write(compressedData)
 
@@ -823,7 +825,7 @@ func (p *packer) AppendObject(ctx context.Context, r io.Reader) (int64, int64, i
 	p.totalSizeUncompressed += uint64(uncompressedSize)
 	p.totalSizeCompressed += uint64(compressedSize)
 
-	return offset, compressedSize, uncompressedSize, nil
+	return offset, compressedSize, nil
 }
 
 func (p *packer) Close() error {
@@ -833,7 +835,7 @@ func (p *packer) Close() error {
 	p.closed = true
 
 	// Write footer: SHA-256 of header + all object data
-	checksum := p.hasher.Sum(nil)
+	checksum := p.footerHasher.Sum(nil)
 	if _, err := p.w.Write(checksum); err != nil {
 		return err
 	}
