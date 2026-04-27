@@ -97,6 +97,14 @@ make sdk-rust           # Generate Rust SDK
 make package-python     # Package Python SDK + wrapper
 ```
 
+## Coding Guidelines
+
+lakeFS follows the [Karpathy Guidelines](skill:andrej-karpathy-skills:karpathy-guidelines) for all coding tasks:
+- **Think Before Coding**: State assumptions, surface tradeoffs, don't hide confusion
+- **Simplicity First**: Minimum code that solves the problem, nothing speculative
+- **Surgical Changes**: Touch only what you must, match existing style
+- **Goal-Driven Execution**: Define verifiable success criteria
+
 ## Common Tasks
 
 - Run a single Go test: `go test -count=1 -v ./pkg/path/to/package -run TestName`
