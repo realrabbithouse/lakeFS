@@ -25,7 +25,7 @@ func TestManager_CreateUploadSession(t *testing.T) {
 	m := NewManager(store, nil, Config{})
 
 	ctx := context.Background()
-	session, err := m.CreateUploadSession(ctx, "repo1", "abc123def456")
+	session, err := m.CreateUploadSession(ctx, "repo1", "abc123def456", 1024, "sha256:abc123", "zstd", 10)
 	require.NoError(t, err)
 	require.Equal(t, "repo1", session.RepositoryId)
 	require.Equal(t, "abc123def456", session.PackfileId)
@@ -48,7 +48,7 @@ func TestManager_CompleteUploadSession(t *testing.T) {
 	ctx := context.Background()
 
 	// Create an upload session
-	session, err := m.CreateUploadSession(ctx, "repo1", "abc123def456")
+	session, err := m.CreateUploadSession(ctx, "repo1", "abc123def456", 1024, "sha256:abc123", "zstd", 10)
 	require.NoError(t, err)
 
 	// Complete it
@@ -70,7 +70,7 @@ func TestManager_AbortUploadSession(t *testing.T) {
 	ctx := context.Background()
 
 	// Create an upload session
-	session, err := m.CreateUploadSession(ctx, "repo1", "abc123def456")
+	session, err := m.CreateUploadSession(ctx, "repo1", "abc123def456", 1024, "sha256:abc123", "zstd", 10)
 	require.NoError(t, err)
 
 	// Abort it
@@ -130,9 +130,9 @@ func TestManager_ListPackfiles_UsesSnapshot(t *testing.T) {
 	ctx := context.Background()
 
 	// Create packfiles via upload sessions
-	session1, err := m.CreateUploadSession(ctx, "repo1", "packfile1")
+	session1, err := m.CreateUploadSession(ctx, "repo1", "packfile1", 1024, "sha256:abc123", "zstd", 10)
 	require.NoError(t, err)
-	session2, err := m.CreateUploadSession(ctx, "repo1", "packfile2")
+	session2, err := m.CreateUploadSession(ctx, "repo1", "packfile2", 1024, "sha256:def456", "zstd", 10)
 	require.NoError(t, err)
 
 	// Complete both

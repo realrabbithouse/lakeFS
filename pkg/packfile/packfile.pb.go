@@ -329,14 +329,19 @@ func (x *PackfileSnapshot) GetLastMergeAt() *timestamppb.Timestamp {
 }
 
 type UploadSession struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	UploadId      string                 `protobuf:"bytes,1,opt,name=upload_id,json=uploadId,proto3" json:"upload_id,omitempty"`
-	PackfileId    string                 `protobuf:"bytes,2,opt,name=packfile_id,json=packfileId,proto3" json:"packfile_id,omitempty"`
-	RepositoryId  string                 `protobuf:"bytes,3,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
-	TmpPath       string                 `protobuf:"bytes,4,opt,name=tmp_path,json=tmpPath,proto3" json:"tmp_path,omitempty"`
-	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	UploadId     string                 `protobuf:"bytes,1,opt,name=upload_id,json=uploadId,proto3" json:"upload_id,omitempty"`
+	PackfileId   string                 `protobuf:"bytes,2,opt,name=packfile_id,json=packfileId,proto3" json:"packfile_id,omitempty"`
+	RepositoryId string                 `protobuf:"bytes,3,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	TmpPath      string                 `protobuf:"bytes,4,opt,name=tmp_path,json=tmpPath,proto3" json:"tmp_path,omitempty"`
+	CreatedAt    *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	// Packfile info from init request for validation at complete time
+	ExpectedSize        int64  `protobuf:"varint,6,opt,name=expected_size,json=expectedSize,proto3" json:"expected_size,omitempty"`
+	ExpectedChecksum    string `protobuf:"bytes,7,opt,name=expected_checksum,json=expectedChecksum,proto3" json:"expected_checksum,omitempty"`
+	Compression         string `protobuf:"bytes,8,opt,name=compression,proto3" json:"compression,omitempty"`
+	ExpectedObjectCount int64  `protobuf:"varint,9,opt,name=expected_object_count,json=expectedObjectCount,proto3" json:"expected_object_count,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *UploadSession) Reset() {
@@ -404,6 +409,34 @@ func (x *UploadSession) GetCreatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *UploadSession) GetExpectedSize() int64 {
+	if x != nil {
+		return x.ExpectedSize
+	}
+	return 0
+}
+
+func (x *UploadSession) GetExpectedChecksum() string {
+	if x != nil {
+		return x.ExpectedChecksum
+	}
+	return ""
+}
+
+func (x *UploadSession) GetCompression() string {
+	if x != nil {
+		return x.Compression
+	}
+	return ""
+}
+
+func (x *UploadSession) GetExpectedObjectCount() int64 {
+	if x != nil {
+		return x.ExpectedObjectCount
+	}
+	return 0
+}
+
 var File_packfile_packfile_proto protoreflect.FileDescriptor
 
 const file_packfile_packfile_proto_rawDesc = "" +
@@ -431,7 +464,7 @@ const file_packfile_packfile_proto_rawDesc = "" +
 	"\x13active_packfile_ids\x18\x02 \x03(\tR\x11activePackfileIds\x12.\n" +
 	"\x13staged_packfile_ids\x18\x03 \x03(\tR\x11stagedPackfileIds\x12@\n" +
 	"\x0elast_commit_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\flastCommitAt\x12>\n" +
-	"\rlast_merge_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vlastMergeAt\"\xc8\x01\n" +
+	"\rlast_merge_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vlastMergeAt\"\xf0\x02\n" +
 	"\rUploadSession\x12\x1b\n" +
 	"\tupload_id\x18\x01 \x01(\tR\buploadId\x12\x1f\n" +
 	"\vpackfile_id\x18\x02 \x01(\tR\n" +
@@ -439,7 +472,11 @@ const file_packfile_packfile_proto_rawDesc = "" +
 	"\rrepository_id\x18\x03 \x01(\tR\frepositoryId\x12\x19\n" +
 	"\btmp_path\x18\x04 \x01(\tR\atmpPath\x129\n" +
 	"\n" +
-	"created_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt*H\n" +
+	"created_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12#\n" +
+	"\rexpected_size\x18\x06 \x01(\x03R\fexpectedSize\x12+\n" +
+	"\x11expected_checksum\x18\a \x01(\tR\x10expectedChecksum\x12 \n" +
+	"\vcompression\x18\b \x01(\tR\vcompression\x122\n" +
+	"\x15expected_object_count\x18\t \x01(\x03R\x13expectedObjectCount*H\n" +
 	"\x0ePackfileStatus\x12\n" +
 	"\n" +
 	"\x06STAGED\x10\x00\x12\r\n" +

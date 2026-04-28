@@ -20,9 +20,16 @@ message Entry {
     BY_PREFIX_DEPRECATED = 0;
     RELATIVE = 1;
     FULL = 2;
+    // PACKFILE indicates the object is stored in a packfile.
+    // The address field contains "packfile:<packfile_id>" and
+    // packfile_offset contains the byte offset within the packfile.
+    PACKFILE = 3;
   }
   AddressType address_type = 6;
   string content_type = 7;
+  // packfile_offset is the byte offset of the object within the packfile.
+  // Valid when address_type is PACKFILE.
+  int64 packfile_offset = 8;
 }
 
 // Task is a generic task status message

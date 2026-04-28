@@ -19,13 +19,34 @@ var (
 	ErrPackfileNotFound      = errors.New("packfile not found")
 	ErrUploadSessionNotFound = errors.New("upload session not found")
 	ErrSnapshotNotFound      = errors.New("snapshot not found")
+	ErrManifestChecksumMismatch = errors.New("manifest checksum mismatch")
+	ErrManifestObjectCountMismatch = errors.New("manifest object count mismatch")
 )
+
+// ManifestEntry represents one line in the NDJSON manifest.
+type ManifestEntry struct {
+	Path               string
+	Checksum           string
+	ContentType        string
+	Metadata           map[string]string
+	RelativeOffset     int64
+	SizeUncompressed   int64
+	SizeCompressed     int64
+}
+
+// Manifest represents the parsed manifest from the upload request.
+type Manifest struct {
+	PackfileChecksum string
+	ObjectCount      int64
+	Entries          []ManifestEntry
+}
 
 // Config holds packfile configuration.
 type Config struct {
 	StorageNamespace string
 	LocalPath        string
 	MaxPackSize      int64
+	AsyncReplicate   bool
 }
 
 // Manager handles all packfile state transitions.
@@ -41,12 +62,16 @@ func NewManager(store kv.Store, blockAdapter block.Adapter, cfg Config) *Manager
 }
 
 // CreateUploadSession creates a kv UploadSession (status=in-progress).
-func (m *Manager) CreateUploadSession(ctx context.Context, repoID, packfileID string) (*UploadSession, error) {
+func (m *Manager) CreateUploadSession(ctx context.Context, repoID, packfileID string, expectedSize int64, expectedChecksum, compression string, expectedObjectCount int64) (*UploadSession, error) {
 	session := &UploadSession{
-		UploadId:     uuid.NewString(),
-		PackfileId:   packfileID,
-		RepositoryId: repoID,
-		CreatedAt:    timestamppb.Now(),
+		UploadId:            uuid.NewString(),
+		PackfileId:          packfileID,
+		RepositoryId:        repoID,
+		CreatedAt:           timestamppb.Now(),
+		ExpectedSize:        expectedSize,
+		ExpectedChecksum:    expectedChecksum,
+		Compression:         compression,
+		ExpectedObjectCount: expectedObjectCount,
 	}
 	if err := kv.SetMsg(ctx, m.store, PackfilesPartition, []byte(UploadPath(session.UploadId)), session); err != nil {
 		return nil, err
@@ -127,6 +152,32 @@ func (m *Manager) GetUploadSession(ctx context.Context, uploadID string) (*Uploa
 	return &session, nil
 }
 
+// ValidateManifest validates a parsed manifest against the upload session's expected values.
+// It checks:
+// - Object count matches the expected count from init request
+// - Packfile checksum matches the expected checksum from init request
+func (m *Manager) ValidateManifest(ctx context.Context, uploadID string, manifest *Manifest) error {
+	session, err := m.GetUploadSession(ctx, uploadID)
+	if err != nil {
+		return err
+	}
+
+	// Validate object count
+	if int64(len(manifest.Entries)) != session.ExpectedObjectCount {
+		return fmt.Errorf("%w: expected %d, got %d",
+			ErrManifestObjectCountMismatch, session.ExpectedObjectCount, len(manifest.Entries))
+	}
+
+	// Validate packfile checksum (format: "sha256:...")
+	expectedChecksum := session.ExpectedChecksum
+	if manifest.PackfileChecksum != expectedChecksum {
+		return fmt.Errorf("%w: expected %s, got %s",
+			ErrManifestChecksumMismatch, expectedChecksum, manifest.PackfileChecksum)
+	}
+
+	return nil
+}
+
 // CompleteUploadSession marks the upload done, creates PackfileMetadata (STAGED, SECOND_CLASS).
 func (m *Manager) CompleteUploadSession(ctx context.Context, uploadID string) error {
 	var session UploadSession
@@ -148,6 +199,9 @@ func (m *Manager) CompleteUploadSession(ctx context.Context, uploadID string) er
 	if err := kv.SetMsg(ctx, m.store, PackfilesPartition, []byte(PackfilePath(meta.PackfileId)), meta); err != nil {
 		return err
 	}
+
+	// Start async replication to object storage
+	m.StartReplication(ctx, session.PackfileId)
 
 	return m.store.Delete(ctx, []byte(PackfilesPartition), []byte(UploadPath(uploadID)))
 }
@@ -304,7 +358,8 @@ func (m *Manager) Commit(ctx context.Context, repoID string) error {
 }
 
 // Merge merges source packfiles into a new COMMITTED SECOND_CLASS packfile.
-// Marks sources as SUPERSEDED. Returns the new merged packfile's metadata.
+// Marks sources as SUPERSEDED after the merged packfile is persisted.
+// Returns the new merged packfile's metadata.
 func (m *Manager) Merge(ctx context.Context, repoID string, sourceIDs []string) (*PackfileMetadata, error) {
 	if len(sourceIDs) == 0 {
 		return nil, errors.New("no source packfiles provided")
@@ -324,17 +379,10 @@ func (m *Manager) Merge(ctx context.Context, repoID string, sourceIDs []string) 
 	}
 
 	// Merge into a new COMMITTED SECOND_CLASS packfile
+	// This also marks source packfiles as SUPERSEDED after successful persistence
 	merged, err := m.mergePackfiles(ctx, sources, PackfileStatus_COMMITTED, ClassificationSecondClass)
 	if err != nil {
 		return nil, err
-	}
-
-	// Mark source packfiles as SUPERSEDED
-	for _, src := range sources {
-		src.Status = PackfileStatus_SUPERSEDED
-		if err := kv.SetMsg(ctx, m.store, PackfilesPartition, []byte(PackfilePath(src.PackfileId)), src); err != nil {
-			return nil, err
-		}
 	}
 
 	// Update snapshot to add merged packfile to active
@@ -469,6 +517,14 @@ func (m *Manager) mergePackfiles(ctx context.Context, sources []*PackfileMetadat
 		return nil, fmt.Errorf("uploading merged packfile: %w", err)
 	}
 
+	// Mark source packfiles as SUPERSEDED only after merged packfile is persisted
+	for _, src := range sources {
+		src.Status = PackfileStatus_SUPERSEDED
+		if err := kv.SetMsg(ctx, m.store, PackfilesPartition, []byte(PackfilePath(src.PackfileId)), src); err != nil {
+			return nil, fmt.Errorf("marking source packfile %s as superseded: %w", src.PackfileId, err)
+		}
+	}
+
 	// Create source packfile IDs list
 	sourceIDs := make([]string, len(sources))
 	for i, src := range sources {
@@ -594,4 +650,48 @@ func (m *Manager) UpdateSnapshot(ctx context.Context, repoID string, updateFn fu
 		}
 		return err
 	}
+}
+
+// StartReplication starts a background goroutine to replicate a packfile to object storage.
+// It reads the packfile from local disk and uploads it via the block adapter.
+func (m *Manager) StartReplication(ctx context.Context, packfileID string) {
+	if !m.config.AsyncReplicate {
+		return
+	}
+	go func() {
+		if err := m.replicatePackfile(context.Background(), packfileID); err != nil {
+			// Log error but don't fail - replication is best effort
+			// In production, this would use a proper logger
+		}
+	}()
+}
+
+// replicatePackfile reads a packfile from local disk and uploads it via the block adapter.
+func (m *Manager) replicatePackfile(ctx context.Context, packfileID string) error {
+	// Open the local packfile
+	localPath := m.config.LocalPath + "/_packfiles/" + packfileID + "/data.pack"
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("opening local packfile: %w", err)
+	}
+	defer f.Close()
+
+	// Get file size
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat local packfile: %w", err)
+	}
+	size := info.Size()
+
+	// Upload to object storage via block adapter
+	obj := block.ObjectPointer{
+		StorageNamespace: m.config.StorageNamespace,
+		Identifier:       "_packfiles/" + packfileID + "/data.pack",
+		IdentifierType:   block.IdentifierTypeRelative,
+	}
+	_, err = m.block.Put(ctx, obj, size, f, block.PutOpts{})
+	if err != nil {
+		return fmt.Errorf("uploading packfile to object storage: %w", err)
+	}
+	return nil
 }

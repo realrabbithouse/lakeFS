@@ -1161,6 +1161,8 @@ func addressTypeToProto(t AddressType) Entry_AddressType {
 		return Entry_RELATIVE
 	case AddressTypeFull:
 		return Entry_FULL
+	case AddressTypePackfile:
+		return Entry_PACKFILE
 	default:
 		panic(fmt.Sprintf("unknown address type: %d", t))
 	}
@@ -1174,6 +1176,8 @@ func addressTypeToCatalog(t Entry_AddressType) AddressType {
 		return AddressTypeRelative
 	case Entry_FULL:
 		return AddressTypeFull
+	case Entry_PACKFILE:
+		return AddressTypePackfile
 	default:
 		panic(fmt.Sprintf("unknown address type: %d", t))
 	}

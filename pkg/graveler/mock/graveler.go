@@ -13,6 +13,57 @@ import (
 	graveler "github.com/treeverse/lakefs/pkg/graveler"
 )
 
+// MockPackfileManager is a mock of PackfileManager interface.
+type MockPackfileManager struct {
+	ctrl     *gomock.Controller
+	recorder *MockPackfileManagerMockRecorder
+}
+
+// MockPackfileManagerMockRecorder is the mock recorder for MockPackfileManager.
+type MockPackfileManagerMockRecorder struct {
+	mock *MockPackfileManager
+}
+
+// NewMockPackfileManager creates a new mock instance.
+func NewMockPackfileManager(ctrl *gomock.Controller) *MockPackfileManager {
+	mock := &MockPackfileManager{ctrl: ctrl}
+	mock.recorder = &MockPackfileManagerMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockPackfileManager) EXPECT() *MockPackfileManagerMockRecorder {
+	return m.recorder
+}
+
+// Commit mocks base method.
+func (m *MockPackfileManager) Commit(ctx context.Context, repoID string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Commit", ctx, repoID)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Commit indicates an expected call of Commit.
+func (mr *MockPackfileManagerMockRecorder) Commit(ctx, repoID interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Commit", reflect.TypeOf((*MockPackfileManager)(nil).Commit), ctx, repoID)
+}
+
+// MergeStaged mocks base method.
+func (m *MockPackfileManager) MergeStaged(ctx context.Context, repoID string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "MergeStaged", ctx, repoID)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// MergeStaged indicates an expected call of MergeStaged.
+func (mr *MockPackfileManagerMockRecorder) MergeStaged(ctx, repoID interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MergeStaged", reflect.TypeOf((*MockPackfileManager)(nil).MergeStaged), ctx, repoID)
+}
+
 // MockConflictResolver is a mock of ConflictResolver interface.
 type MockConflictResolver struct {
 	ctrl     *gomock.Controller

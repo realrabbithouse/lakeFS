@@ -37,6 +37,7 @@ type DBEntry struct {
 	Expired         bool
 	AddressType     AddressType
 	ContentType     string
+	PackfileOffset  int64 // Valid when AddressType == AddressTypePackfile
 }
 
 type CommitLog struct {
@@ -88,6 +89,10 @@ const (
 	// AddressTypeFull indicates that the address is the full address of the object in the object store.
 	// For example: "s3://bucket/foo/bar"
 	AddressTypeFull AddressType = 2
+
+	// AddressTypePackfile indicates the object is stored in a packfile.
+	// PhysicalAddress contains "packfile:<packfile_id>" and PackfileOffset contains the offset.
+	AddressTypePackfile AddressType = 3
 )
 
 //nolint:staticcheck
@@ -99,6 +104,8 @@ func (at AddressType) ToIdentifierType() block.IdentifierType {
 		return block.IdentifierTypeRelative
 	case AddressTypeFull:
 		return block.IdentifierTypeFull
+	case AddressTypePackfile:
+		return block.IdentifierTypeRelative // Packfile uses relative identifier
 	default:
 		panic(fmt.Sprintf("unknown address type: %d", at))
 	}

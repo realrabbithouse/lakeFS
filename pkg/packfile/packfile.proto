@@ -45,4 +45,9 @@ message UploadSession {
   string repository_id = 3;
   string tmp_path = 4;
   google.protobuf.Timestamp created_at = 5;
+  // Packfile info from init request for validation at complete time
+  int64 expected_size = 6;
+  string expected_checksum = 7;
+  string compression = 8;
+  int64 expected_object_count = 9;
 }

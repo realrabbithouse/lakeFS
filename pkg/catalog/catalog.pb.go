@@ -32,6 +32,10 @@ const (
 	Entry_BY_PREFIX_DEPRECATED Entry_AddressType = 0
 	Entry_RELATIVE             Entry_AddressType = 1
 	Entry_FULL                 Entry_AddressType = 2
+	// PACKFILE indicates the object is stored in a packfile.
+	// The address field contains "packfile:<packfile_id>" and
+	// packfile_offset contains the byte offset within the packfile.
+	Entry_PACKFILE Entry_AddressType = 3
 )
 
 // Enum value maps for Entry_AddressType.
@@ -40,11 +44,13 @@ var (
 		0: "BY_PREFIX_DEPRECATED",
 		1: "RELATIVE",
 		2: "FULL",
+		3: "PACKFILE",
 	}
 	Entry_AddressType_value = map[string]int32{
 		"BY_PREFIX_DEPRECATED": 0,
 		"RELATIVE":             1,
 		"FULL":                 2,
+		"PACKFILE":             3,
 	}
 )
 
@@ -76,16 +82,19 @@ func (Entry_AddressType) EnumDescriptor() ([]byte, []int) {
 }
 
 type Entry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Address       string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
-	LastModified  *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=last_modified,json=lastModified,proto3" json:"last_modified,omitempty"`
-	Size          int64                  `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
-	ETag          string                 `protobuf:"bytes,4,opt,name=e_tag,json=eTag,proto3" json:"e_tag,omitempty"`
-	Metadata      map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	AddressType   Entry_AddressType      `protobuf:"varint,6,opt,name=address_type,json=addressType,proto3,enum=catalog.Entry_AddressType" json:"address_type,omitempty"`
-	ContentType   string                 `protobuf:"bytes,7,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Address      string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	LastModified *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=last_modified,json=lastModified,proto3" json:"last_modified,omitempty"`
+	Size         int64                  `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
+	ETag         string                 `protobuf:"bytes,4,opt,name=e_tag,json=eTag,proto3" json:"e_tag,omitempty"`
+	Metadata     map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	AddressType  Entry_AddressType      `protobuf:"varint,6,opt,name=address_type,json=addressType,proto3,enum=catalog.Entry_AddressType" json:"address_type,omitempty"`
+	ContentType  string                 `protobuf:"bytes,7,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`
+	// packfile_offset is the byte offset of the object within the packfile.
+	// Valid when address_type is PACKFILE.
+	PackfileOffset int64 `protobuf:"varint,8,opt,name=packfile_offset,json=packfileOffset,proto3" json:"packfile_offset,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Entry) Reset() {
@@ -165,6 +174,13 @@ func (x *Entry) GetContentType() string {
 		return x.ContentType
 	}
 	return ""
+}
+
+func (x *Entry) GetPackfileOffset() int64 {
+	if x != nil {
+		return x.PackfileOffset
+	}
+	return 0
 }
 
 // Task is a generic task status message
@@ -787,7 +803,7 @@ var File_catalog_catalog_proto protoreflect.FileDescriptor
 
 const file_catalog_catalog_proto_rawDesc = "" +
 	"\n" +
-	"\x15catalog/catalog.proto\x12\acatalog\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17graveler/graveler.proto\"\xa5\x03\n" +
+	"\x15catalog/catalog.proto\x12\acatalog\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17graveler/graveler.proto\"\xdc\x03\n" +
 	"\x05Entry\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\tR\aaddress\x12?\n" +
 	"\rlast_modified\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\flastModified\x12\x12\n" +
@@ -795,14 +811,16 @@ const file_catalog_catalog_proto_rawDesc = "" +
 	"\x05e_tag\x18\x04 \x01(\tR\x04eTag\x128\n" +
 	"\bmetadata\x18\x05 \x03(\v2\x1c.catalog.Entry.MetadataEntryR\bmetadata\x12=\n" +
 	"\faddress_type\x18\x06 \x01(\x0e2\x1a.catalog.Entry.AddressTypeR\vaddressType\x12!\n" +
-	"\fcontent_type\x18\a \x01(\tR\vcontentType\x1a;\n" +
+	"\fcontent_type\x18\a \x01(\tR\vcontentType\x12'\n" +
+	"\x0fpackfile_offset\x18\b \x01(\x03R\x0epackfileOffset\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"?\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"M\n" +
 	"\vAddressType\x12\x18\n" +
 	"\x14BY_PREFIX_DEPRECATED\x10\x00\x12\f\n" +
 	"\bRELATIVE\x10\x01\x12\b\n" +
-	"\x04FULL\x10\x02\"\x89\x02\n" +
+	"\x04FULL\x10\x02\x12\f\n" +
+	"\bPACKFILE\x10\x03\"\x89\x02\n" +
 	"\x04Task\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x129\n" +
