@@ -1,6 +1,7 @@
 package packfile
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -55,29 +56,73 @@ type unpacker struct {
 	valid         bool // true if magic bytes validated
 }
 
-// NewUnpacker creates an Unpacker from an io.ReadSeeker.
-// The ReadSeeker must also implement io.ReaderAt for random access.
-func NewUnpacker(r io.ReadSeeker) Unpacker {
+// NewUnpacker creates an Unpacker from an io.ReadSeeker or io.Reader.
+// If r is not a ReadSeeker, it buffers the data to create a seekable reader.
+// This is necessary because block adapters like mem adapter return io.NopCloser
+// wrapping a bytes.Reader, which doesn't expose the underlying seekable reader.
+func NewUnpacker(r io.Reader) Unpacker {
+	// Try to get ReadSeeker directly
+	if rs, ok := r.(io.ReadSeeker); ok {
+		return newUnpackerWithSeeker(rs)
+	}
+
+	// Not a ReadSeeker - buffer the data to create one
+	// This handles io.NopCloser(bytes.Reader) and similar wrappers
+	data, err := io.ReadAll(r)
+	if err != nil {
+		u := &unpacker{footerHasher: sha256.New()}
+		return u // invalid, will fail on operations
+	}
+
+	rs := bytes.NewReader(data)
+	return newUnpackerWithSeeker(rs)
+}
+
+func newUnpackerWithSeeker(rs io.ReadSeeker) Unpacker {
 	u := &unpacker{
-		r:            r,
+		r:            rs,
 		footerHasher: sha256.New(),
 	}
+
 	// Get io.ReaderAt if available
-	if rat, ok := r.(io.ReaderAt); ok {
+	if rat, ok := rs.(io.ReaderAt); ok {
 		u.rat = rat
+	} else {
+		// Use the ReadSeeker as both reader and a buffered ReaderAt
+		u.rat = newReaderAtFromSeeker(rs)
 	}
+
 	// Load packfile header
-	if _, err := u.r.Read(u.header[:]); err != nil && err != io.EOF {
-		// Will be caught on first operation
+	if _, err := rs.Read(u.header[:]); err != nil && err != io.EOF {
 		return u
 	}
 	if string(u.header[:4]) != Magic {
-		// Invalid magic, will fail on first operation
 		return u
 	}
 	u.compression = Compression(u.header[6])
 	u.valid = true
 	return u
+}
+
+// readerAtFromSeeker wraps an io.ReadSeeker to implement io.ReaderAt
+// by reading the entire content into memory. Use only for small data.
+type readerAtFromSeeker struct {
+	io.ReadSeeker
+	data []byte
+}
+
+func newReaderAtFromSeeker(rs io.ReadSeeker) io.ReaderAt {
+	data, _ := io.ReadAll(rs)
+	_, _ = rs.Seek(0, io.SeekStart)
+	return &readerAtFromSeeker{ReadSeeker: rs, data: data}
+}
+
+func (r *readerAtFromSeeker) ReadAt(p []byte, off int64) (n int, err error) {
+	if off >= int64(len(r.data)) {
+		return 0, io.EOF
+	}
+	n = copy(p, r.data[off:])
+	return n, nil
 }
 
 // ensureValid returns an error if the packfile magic was invalid.
@@ -153,7 +198,7 @@ func (it *scanIter) Next() bool {
 	// Read next object header
 	var objHdr [40]byte
 	n, err := io.ReadFull(it.r, objHdr[:])
-	if err == io.EOF {
+	if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
 		return false // no more objects
 	}
 	if err != nil {
@@ -194,6 +239,8 @@ func (it *scanIter) Object() (ContentHash, int64, int64, int64, io.Reader, error
 		if _, err := io.Copy(io.Discard, io.LimitReader(it.r, it.currentObj.compressedSize)); err != nil {
 			// If we can't discard, at least skip
 		}
+		// Advance position past compressed data
+		it.pos += it.currentObj.compressedSize
 		return it.currentHash, it.currentObj.offset, it.currentObj.uncompressedSize, it.currentObj.compressedSize, nil, nil
 	}
 
@@ -207,6 +254,8 @@ func (it *scanIter) Object() (ContentHash, int64, int64, int64, io.Reader, error
 		}
 		pw.Close()
 	}()
+	// Advance position past compressed data (since we consumed it from it.r)
+	it.pos += it.currentObj.compressedSize
 
 	// Wrap in decompression reader
 	dr, err := NewDecompressionReader(pr, it.compression)

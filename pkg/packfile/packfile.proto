@@ -29,6 +29,9 @@ message PackfileMetadata {
   string checksum_algorithm = 10;
   google.protobuf.Timestamp created_at = 11;
   repeated string source_packfile_ids = 12;
+  // IndexPath is the path to the SSTable index file for O(1) content hash lookups.
+  // Empty string means no index is available.
+  string index_path = 13;
 }
 
 message PackfileSnapshot {

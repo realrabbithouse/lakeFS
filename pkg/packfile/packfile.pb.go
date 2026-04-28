@@ -134,6 +134,9 @@ type PackfileMetadata struct {
 	ChecksumAlgorithm    string                 `protobuf:"bytes,10,opt,name=checksum_algorithm,json=checksumAlgorithm,proto3" json:"checksum_algorithm,omitempty"`
 	CreatedAt            *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	SourcePackfileIds    []string               `protobuf:"bytes,12,rep,name=source_packfile_ids,json=sourcePackfileIds,proto3" json:"source_packfile_ids,omitempty"`
+	// IndexPath is the path to the SSTable index file for O(1) content hash lookups.
+	// Empty string means no index is available.
+	IndexPath            string                 `protobuf:"bytes,13,opt,name=index_path,json=indexPath,proto3" json:"index_path,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -250,6 +253,13 @@ func (x *PackfileMetadata) GetSourcePackfileIds() []string {
 		return x.SourcePackfileIds
 	}
 	return nil
+}
+
+func (x *PackfileMetadata) GetIndexPath() string {
+	if x != nil {
+		return x.IndexPath
+	}
+	return ""
 }
 
 type PackfileSnapshot struct {

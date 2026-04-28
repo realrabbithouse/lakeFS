@@ -89,6 +89,7 @@ func (w *IndexWriter) externalSortWrite() error {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
 	tmpName := tmpFile.Name()
+	defer os.Remove(tmpName) // Clean up temp file on any exit path
 
 	writer := bufio.NewWriter(tmpFile)
 	for _, entry := range w.entries {
@@ -101,11 +102,9 @@ func (w *IndexWriter) externalSortWrite() error {
 	}
 	if err := writer.Flush(); err != nil {
 		tmpFile.Close()
-		os.Remove(tmpName)
 		return fmt.Errorf("writing temp file: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpName)
 		return fmt.Errorf("closing temp file: %w", err)
 	}
 
@@ -113,12 +112,8 @@ func (w *IndexWriter) externalSortWrite() error {
 	sortCmd := exec.Command("sort", "-t", " ", "-k1", tmpName)
 	sortOut, err := sortCmd.Output()
 	if err != nil {
-		os.Remove(tmpName)
 		return fmt.Errorf("running sort command: %w", err)
 	}
-
-	// Clean up temp file
-	os.Remove(tmpName)
 
 	// Parse sorted output into entries
 	sortedEntries, err := parseSortedOutput(sortOut)
