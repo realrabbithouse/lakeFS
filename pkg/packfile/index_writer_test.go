@@ -307,3 +307,103 @@ func TestNewIndexWriter_WithOptionsVariadic(t *testing.T) {
 		t.Errorf("expected estimatedEntryCount = 100, got %d", w.estimatedEntryCount)
 	}
 }
+
+func TestIndexReader_Lookup(t *testing.T) {
+	// Test IndexReader can read back entries written by IndexWriter
+	tmpDir := t.TempDir()
+	indexPath := filepath.Join(tmpDir, "test-index.sst")
+
+	// Create entries
+	entries := []IndexEntry{
+		{Hash: ContentHash([32]byte{0x01}), Offset: 100, SizeUncompressed: 1000, SizeCompressed: 500},
+		{Hash: ContentHash([32]byte{0x02}), Offset: 200, SizeUncompressed: 2000, SizeCompressed: 1000},
+		{Hash: ContentHash([32]byte{0x03}), Offset: 300, SizeUncompressed: 3000, SizeCompressed: 1500},
+	}
+
+	// Write with IndexWriter
+	w, err := NewIndexWriter(indexPath, CompressionNone)
+	if err != nil {
+		t.Fatalf("NewIndexWriter error = %v", err)
+	}
+	for _, e := range entries {
+		if err := w.AddEntry(e); err != nil {
+			t.Fatalf("AddEntry error = %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close error = %v", err)
+	}
+
+	// Read back with IndexReader
+	r, err := NewIndexReader(indexPath)
+	if err != nil {
+		t.Fatalf("NewIndexReader error = %v", err)
+	}
+	defer r.Close()
+
+	// Test looking up existing entry
+	entry, err := r.Lookup(ContentHash([32]byte{0x02}))
+	if err != nil {
+		t.Fatalf("Lookup error = %v", err)
+	}
+	if entry == nil {
+		t.Fatal("expected entry, got nil")
+	}
+	if entry.Offset != 200 {
+		t.Errorf("expected offset 200, got %d", entry.Offset)
+	}
+	if entry.SizeUncompressed != 2000 {
+		t.Errorf("expected sizeUncompressed 2000, got %d", entry.SizeUncompressed)
+	}
+	if entry.SizeCompressed != 1000 {
+		t.Errorf("expected sizeCompressed 1000, got %d", entry.SizeCompressed)
+	}
+
+	// Test looking up non-existent entry
+	notFound, err := r.Lookup(ContentHash([32]byte{0xFF}))
+	if err != nil {
+		t.Fatalf("Lookup error for non-existent = %v", err)
+	}
+	if notFound != nil {
+		t.Errorf("expected nil for non-existent hash, got %+v", notFound)
+	}
+}
+
+func TestIndexReader_Lookup_NotFound(t *testing.T) {
+	// Test IndexReader returns nil for non-existent hashes in a non-empty index
+	tmpDir := t.TempDir()
+	indexPath := filepath.Join(tmpDir, "test-index.sst")
+
+	// Create index with one entry
+	w, err := NewIndexWriter(indexPath, CompressionNone)
+	if err != nil {
+		t.Fatalf("NewIndexWriter error = %v", err)
+	}
+	if err := w.AddEntry(IndexEntry{
+		Hash:             ContentHash([32]byte{0x05}),
+		Offset:           500,
+		SizeUncompressed: 5000,
+		SizeCompressed:   2500,
+	}); err != nil {
+		t.Fatalf("AddEntry error = %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close error = %v", err)
+	}
+
+	// Read from it
+	r, err := NewIndexReader(indexPath)
+	if err != nil {
+		t.Fatalf("NewIndexReader error = %v", err)
+	}
+	defer r.Close()
+
+	// Lookup non-existent hash
+	entry, err := r.Lookup(ContentHash([32]byte{0x01}))
+	if err != nil {
+		t.Fatalf("Lookup error = %v", err)
+	}
+	if entry != nil {
+		t.Errorf("expected nil for non-existent hash, got %+v", entry)
+	}
+}

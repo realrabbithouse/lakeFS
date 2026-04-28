@@ -52,14 +52,29 @@ type Config struct {
 
 // Manager handles all packfile state transitions.
 type Manager struct {
-	store  kv.Store
-	block  block.Adapter
-	config Config
+	store      kv.Store
+	block      block.Adapter
+	config     Config
+	indexCache *IndexCache
+}
+
+// ManagerOption configures Manager behavior.
+type ManagerOption func(*Manager)
+
+// WithIndexCache sets the index cache for SSTable lookups.
+func WithIndexCache(cache *IndexCache) ManagerOption {
+	return func(m *Manager) {
+		m.indexCache = cache
+	}
 }
 
 // NewManager creates a new packfile Manager.
-func NewManager(store kv.Store, blockAdapter block.Adapter, cfg Config) *Manager {
-	return &Manager{store: store, block: blockAdapter, config: cfg}
+func NewManager(store kv.Store, blockAdapter block.Adapter, cfg Config, opts ...ManagerOption) *Manager {
+	m := &Manager{store: store, block: blockAdapter, config: cfg}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // CreateUploadSession creates a kv UploadSession (status=in-progress).
@@ -360,7 +375,7 @@ func (m *Manager) Commit(ctx context.Context, repoID string) error {
 
 // GetObject returns a reader for the object with the given content hash.
 // It searches through the packfiles for the repository.
-// For efficient O(1) lookup, use the index when available.
+// Uses SSTable index for O(1) lookup when available, falls back to full scan.
 func (m *Manager) GetObject(ctx context.Context, repoID string, contentHash ContentHash) (io.Reader, error) {
 	// Get snapshot to find packfiles
 	snap, err := m.GetSnapshot(ctx, repoID)
@@ -380,7 +395,18 @@ func (m *Manager) GetObject(ctx context.Context, repoID string, contentHash Cont
 			continue
 		}
 
-		found, err := m.searchPackfileForHash(ctx, meta, contentHash)
+		// Try index-based lookup first (O(1))
+		found, err := m.getObjectFromIndex(ctx, meta, contentHash)
+		if err != nil {
+			// Log error but continue to fallback
+			continue
+		}
+		if found != nil {
+			return found, nil
+		}
+
+		// Fall back to full scan
+		found, err = m.searchPackfileForHash(ctx, meta, contentHash)
 		if err != nil {
 			continue
 		}
@@ -390,6 +416,48 @@ func (m *Manager) GetObject(ctx context.Context, repoID string, contentHash Cont
 	}
 
 	return nil, fmt.Errorf("content hash not found in any packfile")
+}
+
+// getObjectFromIndex tries to find the object using the SSTable index.
+// Returns the reader if found via index, nil if not found in index.
+func (m *Manager) getObjectFromIndex(ctx context.Context, meta *PackfileMetadata, contentHash ContentHash) (io.Reader, error) {
+	// If no index is available, return nil to trigger full scan
+	if meta.IndexPath == "" {
+		return nil, nil
+	}
+
+	// Open the index file
+	indexReader, err := NewIndexReader(meta.IndexPath)
+	if err != nil {
+		return nil, nil // Fall back to full scan
+	}
+	defer indexReader.Close()
+
+	// Look up the hash in the index
+	entry, err := indexReader.Lookup(contentHash)
+	if err != nil || entry == nil {
+		return nil, nil // Not found in index, fall back to full scan
+	}
+
+	// Found in index - get the object at the offset
+	obj := block.ObjectPointer{
+		StorageNamespace: meta.StorageNamespace,
+		Identifier:       meta.PackfileId,
+		IdentifierType:   block.IdentifierTypeRelative,
+	}
+	reader, err := m.block.Get(ctx, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	unpacker := NewUnpacker(reader)
+	_, objReader, _, _, err := unpacker.GetObject(ctx, entry.Offset)
+	if err != nil {
+		reader.Close()
+		return nil, err
+	}
+
+	return objReader, nil
 }
 
 // searchPackfileForHash scans a packfile for a content hash.
