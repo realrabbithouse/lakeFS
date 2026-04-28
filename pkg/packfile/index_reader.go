@@ -1,6 +1,7 @@
 package packfile
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -55,7 +56,7 @@ func (r *IndexReader) Lookup(hash ContentHash) (*IndexEntry, error) {
 	}
 
 	// Verify we found the exact key (not just the next one)
-	if !bytesEqual(hash[:], key.UserKey) {
+	if !bytes.Equal(hash[:], key.UserKey) {
 		return nil, nil // Not found
 	}
 
@@ -92,19 +93,6 @@ func (r *IndexReader) retrieveValue(lazyValue pebble.LazyValue) ([]byte, error) 
 	var copiedVal = make([]byte, len(val))
 	copy(copiedVal, val)
 	return copiedVal, nil
-}
-
-// bytesEqual compares two byte slices for equality.
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // Close closes the index reader.
