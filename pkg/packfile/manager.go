@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -357,6 +358,78 @@ func (m *Manager) Commit(ctx context.Context, repoID string) error {
 	})
 }
 
+// GetObject returns a reader for the object with the given content hash.
+// It searches through the packfiles for the repository.
+// For efficient O(1) lookup, use the index when available.
+func (m *Manager) GetObject(ctx context.Context, repoID string, contentHash ContentHash) (io.Reader, error) {
+	// Get snapshot to find packfiles
+	snap, err := m.GetSnapshot(ctx, repoID)
+	if err != nil {
+		return nil, fmt.Errorf("getting snapshot: %w", err)
+	}
+
+	// Collect all packfile IDs
+	packfileIDs := make([]string, 0, len(snap.ActivePackfileIds)+len(snap.StagedPackfileIds))
+	packfileIDs = append(packfileIDs, snap.ActivePackfileIds...)
+	packfileIDs = append(packfileIDs, snap.StagedPackfileIds...)
+
+	// Search each packfile for the content hash
+	for _, pfID := range packfileIDs {
+		meta, err := m.GetPackfile(ctx, pfID)
+		if err != nil {
+			continue
+		}
+
+		found, err := m.searchPackfileForHash(ctx, meta, contentHash)
+		if err != nil {
+			continue
+		}
+		if found != nil {
+			return found, nil
+		}
+	}
+
+	return nil, fmt.Errorf("content hash not found in any packfile")
+}
+
+// searchPackfileForHash scans a packfile for a content hash.
+// Returns the reader if found, nil otherwise.
+func (m *Manager) searchPackfileForHash(ctx context.Context, meta *PackfileMetadata, contentHash ContentHash) (io.Reader, error) {
+	obj := block.ObjectPointer{
+		StorageNamespace: meta.StorageNamespace,
+		Identifier:       meta.PackfileId,
+		IdentifierType:   block.IdentifierTypeRelative,
+	}
+	reader, err := m.block.Get(ctx, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	unpacker := NewUnpacker(reader)
+	iter := unpacker.Scan(ctx, false)
+
+	for iter.Next() {
+		hash, _, _, _, objReader, err := iter.Object()
+		if err != nil {
+			iter.Close()
+			reader.Close()
+			return nil, err
+		}
+
+		if hash == contentHash {
+			iter.Close()
+			return objReader, nil
+		}
+	}
+	iter.Close()
+	reader.Close()
+
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	return nil, nil // Not found
+}
+
 // Merge merges source packfiles into a new COMMITTED SECOND_CLASS packfile.
 // Marks sources as SUPERSEDED after the merged packfile is persisted.
 // Returns the new merged packfile's metadata.
@@ -433,11 +506,29 @@ func (m *Manager) mergePackfiles(ctx context.Context, sources []*PackfileMetadat
 	var totalObjectCount int64
 	var totalSizeUncompressed int64
 
+	// Track seen content hashes for deduplication
+	seenHashes := make(map[ContentHash]bool)
+
+	// Create index writer for O(1) content hash lookups
+	// Estimate entry count based on source packfiles
+	estimatedEntries := int64(0)
+	for _, src := range sources {
+		estimatedEntries += src.ObjectCount
+	}
+	indexPath := filepath.Join(m.config.LocalPath, newPackfileID+".index")
+	indexWriter, err := NewIndexWriter(indexPath, CompressionZstd, WithEntryCount(int(estimatedEntries)))
+	if err != nil {
+		packer.Close()
+		return nil, fmt.Errorf("creating index writer: %w", err)
+	}
+
 	// Merge each source packfile
 	for _, src := range sources {
 		srcMeta, err := m.GetPackfile(ctx, src.PackfileId)
 		if err != nil {
 			packer.Close()
+			indexWriter.Close()
+			os.Remove(indexPath)
 			return nil, fmt.Errorf("getting source packfile %s: %w", src.PackfileId, err)
 		}
 
@@ -450,30 +541,53 @@ func (m *Manager) mergePackfiles(ctx context.Context, sources []*PackfileMetadat
 		reader, err := m.block.Get(ctx, obj)
 		if err != nil {
 			packer.Close()
+			indexWriter.Close()
+			os.Remove(indexPath)
 			return nil, fmt.Errorf("reading source packfile %s: %w", src.PackfileId, err)
 		}
 
 		// Create unpacker to scan objects
-		unpacker := NewUnpacker(reader.(io.ReadSeeker))
+		unpacker := NewUnpacker(reader)
 		iter := unpacker.Scan(ctx, false)
 
 		for iter.Next() {
-			// Use iter.Object() directly - it returns the decompressed reader
-			_, _, uncompressedSize, _, objReader, err := iter.Object()
+			// Get content hash, sizes, and reader from iterator
+			contentHash, _, uncompressedSize, compressedSize, objReader, err := iter.Object()
 			if err != nil {
 				iter.Close()
 				reader.Close()
 				packer.Close()
+				indexWriter.Close()
+				os.Remove(indexPath)
 				return nil, fmt.Errorf("reading object from %s: %w", src.PackfileId, err)
 			}
+
+			// Deduplicate by content hash - skip if already seen
+			if seenHashes[contentHash] {
+				continue
+			}
+			seenHashes[contentHash] = true
+
+			// Record packfile-relative offset before appending
+			packOffset := HeaderSize + int64(totalSizeUncompressed)
 
 			_, _, err = packer.AppendObject(ctx, objReader, uncompressedSize)
 			if err != nil {
 				iter.Close()
 				reader.Close()
 				packer.Close()
+				indexWriter.Close()
+				os.Remove(indexPath)
 				return nil, fmt.Errorf("appending object: %w", err)
 			}
+
+			// Add index entry with the packfile-relative offset
+			indexWriter.AddEntry(IndexEntry{
+				Hash:             contentHash,
+				Offset:           packOffset,
+				SizeUncompressed: uncompressedSize,
+				SizeCompressed:   compressedSize,
+			})
 
 			totalObjectCount++
 			totalSizeUncompressed += uncompressedSize
@@ -482,10 +596,19 @@ func (m *Manager) mergePackfiles(ctx context.Context, sources []*PackfileMetadat
 			iter.Close()
 			reader.Close()
 			packer.Close()
+			indexWriter.Close()
+			os.Remove(indexPath)
 			return nil, fmt.Errorf("scanning source packfile %s: %w", src.PackfileId, err)
 		}
 		iter.Close()
 		reader.Close()
+	}
+
+	// Close index writer first (writes SSTable)
+	if err := indexWriter.Close(); err != nil {
+		packer.Close()
+		os.Remove(indexPath)
+		return nil, fmt.Errorf("closing index writer: %w", err)
 	}
 
 	// Close packer to finalize footer
@@ -550,6 +673,7 @@ func (m *Manager) mergePackfiles(ctx context.Context, sources []*PackfileMetadat
 		ChecksumAlgorithm:     "sha256",
 		CreatedAt:             timestamppb.Now(),
 		SourcePackfileIds:     sourceIDs,
+		IndexPath:             indexPath,
 	}
 
 	// Store metadata in kv
@@ -610,7 +734,8 @@ func (m *Manager) GetSnapshot(ctx context.Context, repoID string) (*PackfileSnap
 
 // UpdateSnapshot atomically updates the PackfileSnapshot for a repository using SetIf.
 func (m *Manager) UpdateSnapshot(ctx context.Context, repoID string, updateFn func(*PackfileSnapshot) error) error {
-	for {
+	const maxRetries = 5
+	for retries := 0; retries < maxRetries; retries++ {
 		var snap *PackfileSnapshot
 		var predicate kv.Predicate
 
@@ -645,11 +770,13 @@ func (m *Manager) UpdateSnapshot(ctx context.Context, repoID string, updateFn fu
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			continue // Retry with fresh snapshot
+		if errors.Is(err, kv.ErrPredicateFailed) && retries < maxRetries-1 {
+			// Retry with fresh snapshot
+			continue
 		}
 		return err
 	}
+	return fmt.Errorf("update snapshot exceeded max retries (%d)", maxRetries)
 }
 
 // StartReplication starts a background goroutine to replicate a packfile to object storage.
