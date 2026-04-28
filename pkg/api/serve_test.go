@@ -176,6 +176,7 @@ func setupHandler(t testing.TB) (http.Handler, *dependencies) {
 		authService,
 		authenticationService,
 		c.BlockAdapter,
+		nil, // packfileManager
 		meta,
 		migrator,
 		collector,

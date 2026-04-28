@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"os/signal"
 	"syscall"
 	"text/template"
@@ -39,6 +40,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv/mem"
 	_ "github.com/treeverse/lakefs/pkg/kv/postgres"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/packfile"
 	"github.com/treeverse/lakefs/pkg/stats"
 	"github.com/treeverse/lakefs/pkg/upload"
 	"github.com/treeverse/lakefs/pkg/version"
@@ -135,11 +137,25 @@ var runCmd = &cobra.Command{
 		// send metadata
 		bufferedCollector.CollectMetadata(metadata)
 
+		// Create packfile manager if packfile support is enabled
+		var packfileManager *packfile.Manager
+		nsPrefix := cfg.StorageConfig().GetStorageByID(config.SingleBlockstoreID).GetDefaultNamespacePrefix()
+		if nsPrefix != nil {
+			packfileConfig := packfile.Config{
+				StorageNamespace: *nsPrefix,
+				LocalPath:        filepath.Join(os.TempDir(), "lakefs", "packfiles"),
+				MaxPackSize:      5 * 1024 * 1024 * 1024, // 5GB default max packfile size
+				AsyncReplicate:   true,
+			}
+			packfileManager = packfile.NewManager(kvStore, blockStore, packfileConfig)
+		}
+
 		catalogConfig := catalog.Config{
 			Config:                  cfg,
 			KVStore:                 kvStore,
 			PathProvider:            upload.DefaultPathProvider,
 			ErrorToStatusCodeAndMsg: api.ErrorToStatusAndMsg,
+			PackfileManager:         packfileManager,
 		}
 
 		c, err := catalog.New(ctx, catalogConfig)
@@ -221,6 +237,7 @@ var runCmd = &cobra.Command{
 			authService,
 			authenticationService,
 			blockStore,
+			packfileManager,
 			authMetadataManager,
 			migrator,
 			bufferedCollector,

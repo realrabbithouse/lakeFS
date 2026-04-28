@@ -93,6 +93,7 @@ func TestLocalLoad(t *testing.T) {
 		authService,
 		authenticationService,
 		blockAdapter,
+			nil, // packfileManager
 		meta,
 		migrator,
 		&stats.NullCollector{},

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -39,7 +40,9 @@ import (
 	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/google/uuid"
 	"github.com/treeverse/lakefs/pkg/permissions"
+	"github.com/treeverse/lakefs/pkg/packfile"
 	"github.com/treeverse/lakefs/pkg/samplerepo"
 	"github.com/treeverse/lakefs/pkg/stats"
 	"github.com/treeverse/lakefs/pkg/upload"
@@ -118,6 +121,7 @@ type Controller struct {
 	Auth            auth.Service
 	Authentication  authentication.Service
 	BlockAdapter    block.Adapter
+	PackfileManager *packfile.Manager
 	MetadataManager auth.MetadataManager
 	Migrator        Migrator
 	Collector       stats.Collector
@@ -138,6 +142,7 @@ func NewController(
 	authService auth.Service,
 	authenticationService authentication.Service,
 	blockAdapter block.Adapter,
+	packfileManager *packfile.Manager,
 	metadataManager auth.MetadataManager,
 	migrator Migrator,
 	collector stats.Collector,
@@ -155,6 +160,7 @@ func NewController(
 		Auth:            authService,
 		Authentication:  authenticationService,
 		BlockAdapter:    blockAdapter,
+		PackfileManager: packfileManager,
 		MetadataManager: metadataManager,
 		Migrator:        migrator,
 		Collector:       collector,
@@ -6492,4 +6498,345 @@ func (c *Controller) PullIcebergTable(w http.ResponseWriter, r *http.Request, _ 
 
 func (c *Controller) PushIcebergTable(w http.ResponseWriter, r *http.Request, _ apigen.PushIcebergTableJSONRequestBody, _ string) {
 	writeError(w, r, http.StatusNotImplemented, http.StatusText(http.StatusNotImplemented))
+}
+
+func (c *Controller) InitPackfileUpload(w http.ResponseWriter, r *http.Request, body apigen.InitPackfileUploadJSONRequestBody, repository string) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.WriteObjectAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "init_packfile_upload", r, repository, "", "")
+
+	if c.PackfileManager == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "packfile support not configured")
+		return
+	}
+
+	// Generate packfile ID
+	packfileID := uuid.NewString()
+
+	// Extract packfile info
+	size := body.PackfileInfo.Size
+	checksum := body.PackfileInfo.Checksum
+	compression := "zstd"
+	if body.PackfileInfo.Compression != nil {
+		compression = *body.PackfileInfo.Compression
+	}
+	objectCount := int64(0)
+	if body.PackfileInfo.ObjectCount != nil {
+		objectCount = *body.PackfileInfo.ObjectCount
+	}
+
+	// Create upload session
+	session, err := c.PackfileManager.CreateUploadSession(ctx, repository, packfileID, size, checksum, compression, objectCount)
+	if err != nil {
+		if c.handleAPIError(ctx, w, r, err) {
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "failed to create upload session")
+		return
+	}
+
+	// Generate pre-signed URLs for packfile data and manifest uploads
+	// For now, use the tmp_path directly since presigned URLs may not be available for all block adapters
+	packfileUrl := session.TmpPath
+	manifestUrl := session.TmpPath + ".manifest"
+
+	response := apigen.InitPackfileUploadResult{
+		UploadId:     session.UploadId,
+		PackfileUrl:  packfileUrl,
+		ManifestUrl:  manifestUrl,
+	}
+	writeResponse(w, r, http.StatusCreated, response)
+}
+
+func (c *Controller) UploadPackfileData(w http.ResponseWriter, r *http.Request, repository string, uploadId string) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.WriteObjectAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "upload_packfile_data", r, repository, "", "")
+
+	if c.PackfileManager == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "packfile support not configured")
+		return
+	}
+
+	// Get upload session to get the tmp path
+	session, err := c.PackfileManager.GetUploadSession(ctx, uploadId)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, "upload session not found")
+		return
+	}
+
+	// Ensure parent directory exists
+	tmpDir := filepath.Dir(session.TmpPath)
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to create tmp directory: "+err.Error())
+		return
+	}
+
+	// Open the tmp file for writing (truncate if exists)
+	f, err := os.OpenFile(session.TmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to open tmp file: "+err.Error())
+		return
+	}
+
+	// Stream the request body to the file
+	written, err := io.Copy(f, r.Body)
+	if err != nil {
+		_ = f.Close()
+		writeError(w, r, http.StatusInternalServerError, "failed to write packfile data: "+err.Error())
+		return
+	}
+	if err := f.Close(); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to close tmp file: "+err.Error())
+		return
+	}
+
+	response := struct {
+		BytesWritten int64 `json:"bytes_written"`
+	}{written}
+	writeResponse(w, r, http.StatusOK, response)
+}
+
+func (c *Controller) UploadPackfileManifest(w http.ResponseWriter, r *http.Request, body apigen.UploadPackfileManifestJSONRequestBody, repository string, uploadId string) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.WriteObjectAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "upload_packfile_manifest", r, repository, "", "")
+
+	if c.PackfileManager == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "packfile support not configured")
+		return
+	}
+
+	// Get upload session to verify it exists
+	session, err := c.PackfileManager.GetUploadSession(ctx, uploadId)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, "upload session not found")
+		return
+	}
+
+	// Convert API manifest to internal manifest
+	entries := make([]packfile.ManifestEntry, 0, len(body.Entries))
+	for _, entry := range body.Entries {
+		entries = append(entries, packfile.ManifestEntry{
+			Path:             entry.RelativePath,
+			Checksum:         entry.ContentHash,
+			SizeUncompressed: entry.SizeBytes,
+		})
+	}
+	manifest := &packfile.Manifest{
+		Entries: entries,
+	}
+
+	// Validate the manifest
+	err = c.PackfileManager.ValidateManifest(ctx, session.UploadId, manifest)
+	if err != nil {
+		if c.handleAPIError(ctx, w, r, err) {
+			return
+		}
+		writeError(w, r, http.StatusBadRequest, "failed to validate manifest: "+err.Error())
+		return
+	}
+
+	writeResponse(w, r, http.StatusOK, nil)
+}
+
+func (c *Controller) CompletePackfileUpload(w http.ResponseWriter, r *http.Request, repository string, uploadId string) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.WriteObjectAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "complete_packfile_upload", r, repository, "", "")
+
+	if c.PackfileManager == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "packfile support not configured")
+		return
+	}
+
+	err := c.PackfileManager.CompleteUploadSession(ctx, uploadId)
+	if err != nil {
+		if errors.Is(err, packfile.ErrUploadSessionNotFound) {
+			writeError(w, r, http.StatusNotFound, "upload session not found")
+			return
+		}
+		if c.handleAPIError(ctx, w, r, err) {
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "failed to complete upload: "+err.Error())
+		return
+	}
+
+	response := apigen.CompletePackfileUploadResult{
+		PackfileId: uploadId,
+		Status:     "STAGED",
+	}
+	writeResponse(w, r, http.StatusOK, response)
+}
+
+func (c *Controller) AbortPackfileUpload(w http.ResponseWriter, r *http.Request, repository string, uploadId string) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.WriteObjectAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "abort_packfile_upload", r, repository, "", "")
+
+	if c.PackfileManager == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "packfile support not configured")
+		return
+	}
+
+	err := c.PackfileManager.AbortUploadSession(ctx, uploadId)
+	if err != nil {
+		if errors.Is(err, packfile.ErrUploadSessionNotFound) {
+			writeError(w, r, http.StatusNotFound, "upload session not found")
+			return
+		}
+		if c.handleAPIError(ctx, w, r, err) {
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "failed to abort upload: "+err.Error())
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *Controller) MergePackfiles(w http.ResponseWriter, r *http.Request, body apigen.MergePackfilesJSONRequestBody, repository string) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.WriteObjectAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "merge_packfiles", r, repository, "", "")
+
+	if c.PackfileManager == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "packfile support not configured")
+		return
+	}
+
+	merged, err := c.PackfileManager.Merge(ctx, repository, body.SourcePackfileIds)
+	if err != nil {
+		if c.handleAPIError(ctx, w, r, err) {
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "failed to merge packfiles: "+err.Error())
+		return
+	}
+
+	response := apigen.PackfileMergeResult{
+		PackfileId: merged.PackfileId,
+		Status:     apigen.PackfileStatus(merged.Status.String()),
+	}
+	writeResponse(w, r, http.StatusOK, response)
+}
+
+func (c *Controller) GetPackfile(w http.ResponseWriter, r *http.Request, repository string, packfileId string) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.ReadObjectAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "get_packfile", r, repository, "", "")
+
+	if c.PackfileManager == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "packfile support not configured")
+		return
+	}
+
+	meta, err := c.PackfileManager.GetPackfile(ctx, packfileId)
+	if err != nil {
+		if errors.Is(err, packfile.ErrPackfileNotFound) {
+			writeError(w, r, http.StatusNotFound, "packfile not found")
+			return
+		}
+		if c.handleAPIError(ctx, w, r, err) {
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "failed to get packfile: "+err.Error())
+		return
+	}
+
+	response := apigen.PackfileInfoResponse{
+		PackfileId: meta.PackfileId,
+		Status:     apigen.PackfileStatus(meta.Status.String()),
+	}
+	writeResponse(w, r, http.StatusOK, response)
+}
+
+func (c *Controller) ListPackfiles(w http.ResponseWriter, r *http.Request, repository string, _ apigen.ListPackfilesParams) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.ReadObjectAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "list_packfiles", r, repository, "", "")
+
+	if c.PackfileManager == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "packfile support not configured")
+		return
+	}
+
+	packfiles, err := c.PackfileManager.ListPackfiles(ctx, repository)
+	if err != nil {
+		if c.handleAPIError(ctx, w, r, err) {
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "failed to list packfiles: "+err.Error())
+		return
+	}
+
+	results := make([]apigen.PackfileInfoResponse, 0, len(packfiles))
+	for _, pf := range packfiles {
+		results = append(results, apigen.PackfileInfoResponse{
+			PackfileId: pf.PackfileId,
+			Status:     apigen.PackfileStatus(pf.Status.String()),
+		})
+	}
+
+	response := apigen.PackfileList{
+		Results: results,
+	}
+	writeResponse(w, r, http.StatusOK, response)
 }

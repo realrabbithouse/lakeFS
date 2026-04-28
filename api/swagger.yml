@@ -2228,6 +2228,236 @@ components:
           default: false
           description: Creates namespace in local catalog if not exist
 
+    PackfileStatus:
+      type: string
+      enum:
+        - STAGED
+        - COMMITTED
+        - SUPERSEDED
+        - DELETED
+      description: Lifecycle status of a packfile
+
+    PackfileInfo:
+      type: object
+      required:
+        - size
+        - checksum
+      properties:
+        size:
+          type: integer
+          format: int64
+          description: Expected total size of the packfile in bytes
+        checksum:
+          type: string
+          description: Expected SHA-256 checksum of the packfile data
+        compression:
+          type: string
+          description: Compression algorithm ("zstd", "gzip", "none")
+          default: "zstd"
+        object_count:
+          type: integer
+          format: int64
+          description: Expected number of objects in the packfile
+
+    InitPackfileUpload:
+      type: object
+      required:
+        - packfile_info
+      properties:
+        packfile_info:
+          $ref: "#/components/schemas/PackfileInfo"
+        validate_object_checksum:
+          type: boolean
+          default: true
+          description: Validate each object's content hash against embedded hash during upload
+
+    InitPackfileUploadResult:
+      type: object
+      required:
+        - upload_id
+        - packfile_url
+        - manifest_url
+      properties:
+        upload_id:
+          type: string
+          description: Unique identifier for this upload session
+        packfile_url:
+          type: string
+          description: Pre-signed URL for uploading packfile data
+        manifest_url:
+          type: string
+          description: Pre-signed URL for uploading the packfile manifest
+
+    PackfileManifestEntry:
+      type: object
+      required:
+        - relative_path
+        - absolute_address
+        - size_bytes
+        - content_hash
+      properties:
+        relative_path:
+          type: string
+          description: Relative path of the object within the packfile
+        absolute_address:
+          type: string
+          description: Absolute storage address of the object data
+        size_bytes:
+          type: integer
+          format: int64
+          description: Size of the object in bytes
+        content_hash:
+          type: string
+          description: SHA-256 content hash of the object
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Additional metadata for the object
+
+    PackfileManifest:
+      type: object
+      required:
+        - entries
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackfileManifestEntry"
+        total_size:
+          type: integer
+          format: int64
+          description: Total size of all objects in bytes
+        total_objects:
+          type: integer
+          format: int64
+          description: Total number of objects
+
+    StagedEntry:
+      type: object
+      required:
+        - relative_path
+        - absolute_address
+        - size_bytes
+        - content_hash
+      properties:
+        relative_path:
+          type: string
+          description: Relative path of the staged object
+        absolute_address:
+          type: string
+          description: Absolute storage address where the object is staged
+        size_bytes:
+          type: integer
+          format: int64
+          description: Size of the staged object in bytes
+        content_hash:
+          type: string
+          description: SHA-256 content hash of the staged object
+
+    CompletePackfileUploadResult:
+      type: object
+      required:
+        - packfile_id
+        - status
+      properties:
+        packfile_id:
+          type: string
+          description: Unique identifier for the completed packfile
+        status:
+          $ref: "#/components/schemas/PackfileStatus"
+
+    PackfileMerge:
+      type: object
+      required:
+        - source_packfile_ids
+        - destination_packfile_id
+      properties:
+        source_packfile_ids:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: List of source packfile IDs to merge from
+        destination_packfile_id:
+          type: string
+          description: Destination packfile ID to merge into
+        merge_strategy:
+          type: string
+          enum:
+            - APPEND
+            - REPLACE
+          default: APPEND
+          description: How to handle duplicate relative paths
+
+    PackfileMergeResult:
+      type: object
+      required:
+        - packfile_id
+        - status
+      properties:
+        packfile_id:
+          type: string
+          description: The merged packfile ID
+        status:
+          $ref: "#/components/schemas/PackfileStatus"
+        objects_merged:
+          type: integer
+          format: int64
+          description: Number of objects successfully merged
+
+    PackfileInfoResponse:
+      type: object
+      required:
+        - packfile_id
+        - status
+      properties:
+        packfile_id:
+          type: string
+          description: Unique identifier for the packfile
+        status:
+          $ref: "#/components/schemas/PackfileStatus"
+        repository_id:
+          type: string
+          description: Repository this packfile belongs to
+        storage_namespace:
+          type: string
+          description: Storage namespace where the packfile is stored
+        object_count:
+          type: integer
+          format: int64
+          description: Number of objects in the packfile
+        size_bytes:
+          type: integer
+          format: int64
+          description: Total size in bytes
+        size_bytes_compressed:
+          type: integer
+          format: int64
+          description: Compressed size in bytes
+        compression_algorithm:
+          type: string
+          description: Compression algorithm used
+        checksum_algorithm:
+          type: string
+          description: Checksum algorithm used
+        created_at:
+          type: string
+          format: date-time
+          description: When the packfile was created
+
+    PackfileList:
+      type: object
+      required:
+        - results
+      properties:
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackfileInfoResponse"
+
 paths:
   /setup_comm_prefs:
     post:
@@ -7206,6 +7436,264 @@ paths:
           description: successfully pulled table from remote
         400:
           $ref: "#/components/responses/BadRequest"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repositories/{repository}/objects/pack:
+    post:
+      tags:
+        - packfile
+      operationId: initPackfileUpload
+      summary: Initialize a packfile upload session
+      parameters:
+        - in: path
+          name: repository
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InitPackfileUpload"
+      responses:
+        201:
+          description: Upload session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InitPackfileUploadResult"
+        400:
+          $ref: "#/components/responses/BadRequest"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/ServerError"
+    get:
+      tags:
+        - packfile
+      operationId: listPackfiles
+      summary: List packfiles in a repository
+      parameters:
+        - in: path
+          name: repository
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/PaginationPrefix"
+        - $ref: "#/components/parameters/PaginationAfter"
+        - $ref: "#/components/parameters/PaginationAmount"
+        - $ref: "#/components/parameters/PaginationDelimiter"
+      responses:
+        200:
+          description: List of packfiles
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackfileList"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repositories/{repository}/objects/pack/{upload_id}/data:
+    put:
+      tags:
+        - packfile
+      operationId: uploadPackfileData
+      summary: Upload packfile data bytes
+      parameters:
+        - in: path
+          name: repository
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: upload_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        200:
+          description: Packfile data uploaded successfully
+        400:
+          $ref: "#/components/responses/BadRequest"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repositories/{repository}/objects/pack/{upload_id}/manifest:
+    put:
+      tags:
+        - packfile
+      operationId: uploadPackfileManifest
+      summary: Upload packfile manifest
+      parameters:
+        - in: path
+          name: repository
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: upload_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PackfileManifest"
+      responses:
+        200:
+          description: Manifest uploaded successfully
+        400:
+          $ref: "#/components/responses/BadRequest"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repositories/{repository}/objects/pack/{upload_id}/complete:
+    post:
+      tags:
+        - packfile
+      operationId: completePackfileUpload
+      summary: Complete a packfile upload session
+      parameters:
+        - in: path
+          name: repository
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: upload_id
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: Upload completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompletePackfileUploadResult"
+        400:
+          $ref: "#/components/responses/BadRequest"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repositories/{repository}/objects/pack/{upload_id}:
+    delete:
+      tags:
+        - packfile
+      operationId: abortPackfileUpload
+      summary: Abort a packfile upload session
+      parameters:
+        - in: path
+          name: repository
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: upload_id
+          required: true
+          schema:
+            type: string
+      responses:
+        204:
+          description: Upload aborted successfully
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repositories/{repository}/objects/pack/merge:
+    post:
+      tags:
+        - packfile
+      operationId: mergePackfiles
+      summary: Merge multiple packfiles into one
+      parameters:
+        - in: path
+          name: repository
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PackfileMerge"
+      responses:
+        200:
+          description: Packfiles merged successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackfileMergeResult"
+        400:
+          $ref: "#/components/responses/BadRequest"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repositories/{repository}/objects/pack/{packfile_id}:
+    get:
+      tags:
+        - packfile
+      operationId: getPackfile
+      summary: Get packfile information
+      parameters:
+        - in: path
+          name: repository
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: packfile_id
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: Packfile information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackfileInfoResponse"
         401:
           $ref: "#/components/responses/Unauthorized"
         404:

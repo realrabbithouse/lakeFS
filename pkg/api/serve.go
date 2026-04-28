@@ -22,6 +22,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/packfile"
 	"github.com/treeverse/lakefs/pkg/stats"
 	"github.com/treeverse/lakefs/pkg/upload"
 )
@@ -40,6 +41,7 @@ func Serve(
 	authService auth.Service,
 	authenticationService authentication.Service,
 	blockAdapter block.Adapter,
+	packfileManager *packfile.Manager,
 	metadataManager auth.MetadataManager,
 	migrator Migrator,
 	collector stats.Collector,
@@ -89,6 +91,7 @@ func Serve(
 		authService,
 		authenticationService,
 		blockAdapter,
+		packfileManager,
 		metadataManager,
 		migrator,
 		collector,

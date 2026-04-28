@@ -44,6 +44,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/ident"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/packfile"
 	"github.com/treeverse/lakefs/pkg/pyramid"
 	pyramidparams "github.com/treeverse/lakefs/pkg/pyramid/params"
 	"github.com/treeverse/lakefs/pkg/upload"
@@ -233,6 +234,9 @@ type Config struct {
 	SettingsManagerOption   settings.ManagerOption
 	PathProvider            *upload.PathPartitionProvider
 	ErrorToStatusCodeAndMsg ErrorToStatusCodeAndMsg
+	// PackfileManager is an optional packfile manager for packfile support.
+	// If nil, packfile support is disabled.
+	PackfileManager *packfile.Manager
 }
 
 type ErrorToStatusCodeAndMsg func(logger logging.Logger, err error) (status int, msg string, ok bool)
@@ -412,6 +416,11 @@ func New(ctx context.Context, cfg Config) (*Catalog, error) {
 	// The size of the workPool is determined by the number of workers and the number of desired pending tasks for each worker.
 	workPool := pond.NewPool(sharedWorkers, pond.WithContext(ctx))
 
+	var packfileManagerAdapter graveler.PackfileManager
+	if cfg.PackfileManager != nil {
+		packfileManagerAdapter = NewPackfileManagerAdapter(cfg.PackfileManager)
+	}
+
 	gStore := graveler.NewGraveler(graveler.GravelerConfig{
 		CommittedManager:         committedManager,
 		StagingManager:           stagingManager,
@@ -420,6 +429,7 @@ func New(ctx context.Context, cfg Config) (*Catalog, error) {
 		ProtectedBranchesManager: protectedBranchesManager,
 		DeleteSensor:             deleteSensor,
 		WorkPool:                 workPool,
+		PackfileManager:          packfileManagerAdapter,
 	})
 	closers = append(closers, &ctxCloser{cancelFn}, rangeFS, metaRangeFS)
 
