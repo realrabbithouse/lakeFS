@@ -3,6 +3,7 @@ package packfile
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,6 +21,7 @@ type PackfileHandle struct {
 	PackfileID   PackfileID
 	IndexReader  *IndexReader
 	DataFilePath string
+	DataFile     *os.File  // open data file for GetObject, may be nil
 	handle       *cacheHandle
 }
 
@@ -31,7 +33,7 @@ type cacheHandle struct {
 	mu      sync.Mutex
 }
 
-// Close decrements the reference count and closes the reader if refcount reaches zero.
+// Close decrements the reference count and closes the data file if refcount reaches zero.
 // If refcount > 0, the entry remains in cache.
 func (h *PackfileHandle) Close() error {
 	h.handle.mu.Lock()
@@ -41,6 +43,12 @@ func (h *PackfileHandle) Close() error {
 		return nil
 	}
 	h.handle.closed = true
+
+	// Close data file if open
+	if h.DataFile != nil {
+		h.DataFile.Close()
+		h.DataFile = nil
+	}
 
 	// Decrement refcount
 	newCount := atomic.AddInt32(&h.handle.entry.Refcount, -1)
@@ -55,6 +63,60 @@ func (h *PackfileHandle) Close() error {
 		h.handle.cache.entries.Delete(h.handle.entry.PackfileID)
 	}
 
+	return nil
+}
+
+// GetObject reads and decompresses a single object by content hash.
+// Returns ErrObjectNotFound if hash not in index.
+// The caller must close the returned ReadCloser when done.
+func (h *PackfileHandle) GetObject(ctx context.Context, contentHash ContentHash) (io.ReadCloser, error) {
+	// Look up offset from index
+	offset, sizeUncomp, _, err := h.IndexReader.Get(ctx, contentHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// Open data file if not already open
+	if h.DataFile == nil {
+		f, err := os.Open(h.DataFilePath)
+		if err != nil {
+			return nil, fmt.Errorf("packfile: opening data file: %w", err)
+		}
+		h.DataFile = f
+	}
+
+	// Seek to object offset
+	if _, err := h.DataFile.Seek(offset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("packfile: seeking to object offset: %w", err)
+	}
+
+	// Read object from current position
+	obj, err := ReadObject(h.DataFile)
+	if err != nil {
+		return nil, fmt.Errorf("packfile: reading object: %w", err)
+	}
+
+	pkgLogger.Info("packfile: get object",
+		"packfile_id", h.PackfileID,
+		"content_hash", contentHash.String(),
+		"size_uncompressed", sizeUncomp)
+
+	// Wrap the reader in a ReadCloser that closes the data file
+	return &objectReadCloser{
+		Reader: obj.Data,
+		file:  h.DataFile,
+	}, nil
+}
+
+// objectReadCloser wraps an io.Reader and closes the associated data file on close.
+type objectReadCloser struct {
+	io.Reader
+	file *os.File
+}
+
+func (c *objectReadCloser) Close() error {
+	// Close is a no-op here because PackfileHandle.Close() closes the data file.
+	// This allows the caller to read without affecting other readers.
 	return nil
 }
 
