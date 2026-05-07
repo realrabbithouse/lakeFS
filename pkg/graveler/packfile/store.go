@@ -63,6 +63,7 @@ type StoreInterface interface {
 	DeleteUploadSession(ctx context.Context, uploadID string) error
 	UpdateSnapshotWithRetry(ctx context.Context, repoID graveler.RepositoryID, updateFn func(*PackfileSnapshot) error) error
 	ScanPackfiles(ctx context.Context, repoID graveler.RepositoryID, after string, limit int) (PackfilesIterator, error)
+	ScanPackfilesByStatus(ctx context.Context, repoID graveler.RepositoryID, status PackfileStatus) (PackfilesIterator, error)
 }
 
 // PackfilesIterator iterates over packfile metadata entries.
@@ -368,4 +369,71 @@ func (s *Store) ScanPackfiles(ctx context.Context, repoID graveler.RepositoryID,
 		iter:   iter,
 		repoID: string(repoID),
 	}, nil
+}
+
+// ScanPackfilesByStatus returns an iterator over all packfiles with a given status for a repository.
+func (s *Store) ScanPackfilesByStatus(ctx context.Context, repoID graveler.RepositoryID, status PackfileStatus) (PackfilesIterator, error) {
+	prefix := fmt.Sprintf("packfile:%s:", repoID)
+	startKey := []byte(prefix)
+
+	iter, err := s.kvStore.Scan(ctx, []byte(PackfilesPartition), kv.ScanOptions{
+		KeyStart:  startKey,
+		BatchSize: 1000, // Use large batch to get all SUPERSEDED packfiles
+	})
+	if err != nil {
+		return nil, fmt.Errorf("packfile: scanning packfiles by status: %w", err)
+	}
+
+	return &packfilesByStatusIterator{
+		iter:   iter,
+		repoID: string(repoID),
+		status: status,
+	}, nil
+}
+
+// packfilesByStatusIterator filters packfiles by status.
+type packfilesByStatusIterator struct {
+	iter   kv.EntriesIterator
+	repoID string
+	status PackfileStatus
+	current *PackfileMetadata
+}
+
+func (p *packfilesByStatusIterator) Next() bool {
+	for p.iter.Next() {
+		entry := p.iter.Entry()
+		if entry == nil {
+			continue
+		}
+		// Skip entries that don't match our prefix
+		expectedPrefix := fmt.Sprintf("packfile:%s:", p.repoID)
+		if !bytes.HasPrefix(entry.Key, []byte(expectedPrefix)) {
+			continue
+		}
+		meta, err := decodePackfileEntry(entry.Value)
+		if err != nil {
+			p.current = nil
+			continue
+		}
+		// Filter by status
+		if meta.Status != p.status {
+			continue
+		}
+		p.current = meta
+		return true
+	}
+	p.current = nil
+	return false
+}
+
+func (p *packfilesByStatusIterator) Value() *PackfileMetadata {
+	return p.current
+}
+
+func (p *packfilesByStatusIterator) Err() error {
+	return p.iter.Err()
+}
+
+func (p *packfilesByStatusIterator) Close() {
+	p.iter.Close()
 }

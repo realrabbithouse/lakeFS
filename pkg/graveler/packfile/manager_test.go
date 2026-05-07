@@ -93,6 +93,53 @@ func (m *mockStoreManager) ScanPackfiles(ctx context.Context, repoID graveler.Re
 	return &mockPackfilesIterator{packfiles: m.packfiles, repoID: string(repoID), after: after, limit: limit}, nil
 }
 
+func (m *mockStoreManager) ScanPackfilesByStatus(ctx context.Context, repoID graveler.RepositoryID, status PackfileStatus) (PackfilesIterator, error) {
+	return &mockPackfilesByStatusIterator{packfiles: m.packfiles, repoID: string(repoID), status: status}, nil
+}
+
+// mockPackfilesByStatusIterator filters packfiles by status.
+type mockPackfilesByStatusIterator struct {
+	packfiles map[string]*PackfileMetadata
+	repoID    string
+	status    PackfileStatus
+	index     int
+	keys      []string
+	current   *PackfileMetadata
+}
+
+func (m *mockPackfilesByStatusIterator) Next() bool {
+	if m.keys == nil {
+		for k := range m.packfiles {
+			if strings.HasPrefix(k, m.repoID+"/") {
+				m.keys = append(m.keys, k)
+			}
+		}
+		sort.Strings(m.keys)
+	}
+	for m.index < len(m.keys) {
+		key := m.keys[m.index]
+		m.index++
+		meta := m.packfiles[key]
+		if meta != nil && meta.Status == m.status {
+			m.current = meta
+			return true
+		}
+	}
+	m.current = nil
+	return false
+}
+
+func (m *mockPackfilesByStatusIterator) Value() *PackfileMetadata {
+	return m.current
+}
+
+func (m *mockPackfilesByStatusIterator) Err() error {
+	return nil
+}
+
+func (m *mockPackfilesByStatusIterator) Close() {
+}
+
 // mockPackfilesIterator is a simple iterator for testing.
 type mockPackfilesIterator struct {
 	packfiles map[string]*PackfileMetadata
@@ -195,6 +242,9 @@ func (w *managerStoreAdapter) UpdateSnapshotWithRetry(ctx context.Context, repoI
 }
 func (w *managerStoreAdapter) ScanPackfiles(ctx context.Context, repoID graveler.RepositoryID, after string, limit int) (PackfilesIterator, error) {
 	return w.mock.ScanPackfiles(ctx, repoID, after, limit)
+}
+func (w *managerStoreAdapter) ScanPackfilesByStatus(ctx context.Context, repoID graveler.RepositoryID, status PackfileStatus) (PackfilesIterator, error) {
+	return w.mock.ScanPackfilesByStatus(ctx, repoID, status)
 }
 
 func TestNewPackfileManager(t *testing.T) {
@@ -414,7 +464,7 @@ func TestManagerContextPropagation(t *testing.T) {
 	_, _ = manager.CreateUploadSession(ctx, graveler.RepositoryID("r"), "u", "/tmp")
 	_ = manager.CompleteUploadSession(ctx, "u")
 	_ = manager.AbortUploadSession(ctx, "u")
-	_ = manager.MergeStaged(ctx, graveler.RepositoryID("r"))
+	_, _ = manager.MergeStaged(ctx, graveler.RepositoryID("r"))
 	_ = manager.Commit(ctx, graveler.RepositoryID("r"))
 	_ = manager.CleanupSuperseded(ctx, graveler.RepositoryID("r"))
 }
