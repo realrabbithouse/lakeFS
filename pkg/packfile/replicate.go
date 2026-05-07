@@ -91,7 +91,12 @@ func getReplicationState() *replicationState {
 
 // backoffDuration calculates exponential backoff interval
 func backoffDuration(retryCount uint8, baseInterval time.Duration, maxInterval time.Duration) time.Duration {
-	interval := baseInterval * time.Duration(1<<retryCount) // 1s, 2s, 4s, 8s, ...
+	// Limit retry count to prevent overflow - max backoff is 2^63 which far exceeds any practical interval
+	shift := retryCount
+	if shift > 63 {
+		shift = 63
+	}
+	interval := baseInterval * time.Duration(1<<shift) // 1s, 2s, 4s, 8s, ...
 	if interval > maxInterval {
 		interval = maxInterval
 	}
@@ -140,7 +145,7 @@ func StartReplication(ctx context.Context, packfileID PackfileID, packfilePath s
 
 	// Spawn async replication goroutine
 	go func() {
-		replicatePackfileToS3(context.Background(), packfileID, packfilePath, indexPath)
+		replicatePackfileToS3(ctx, packfileID, packfilePath, indexPath)
 	}()
 
 	return nil
@@ -355,13 +360,14 @@ func updateReplicationError(state *replicationState, packfileID PackfileID, err 
 // StartReconciliationLoop starts the background loop that retries FAILED replications
 // Returns a stop function to call during shutdown
 func StartReconciliationLoop(ctx context.Context, interval time.Duration) func() {
-	state := getReplicationState()
-	stopCh := state.stopCh
+	// Use a fresh stop channel per reconciliation loop to avoid interference between loops
+	stopCh := make(chan struct{})
 
 	pkgLogger.Info("packfile: reconciliation loop started",
 		"interval", interval.String())
 
 	go func() {
+		// Use the provided interval, not config.ReconcileInterval
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -388,16 +394,17 @@ func StartReconciliationLoop(ctx context.Context, interval time.Duration) func()
 func reconcileFailedReplications(ctx context.Context) {
 	state := getReplicationState()
 
-	state.mu.RLock()
+	state.mu.Lock()
 	var failedIDs []PackfileID
 	for id, repl := range state.replications {
 		if repl.Status == ReplicationStatusFailed {
 			failedIDs = append(failedIDs, id)
 		}
 	}
-	state.mu.RUnlock()
+	// Don't unlock yet - we need to modify the state
 
 	if len(failedIDs) == 0 {
+		state.mu.Unlock()
 		return
 	}
 
@@ -405,19 +412,18 @@ func reconcileFailedReplications(ctx context.Context) {
 		"count", len(failedIDs))
 
 	for _, packfileID := range failedIDs {
-		// Get the packfile path - this would be looked up from KV in a full implementation
-		// For now, we just update the status to retry
-		state.mu.Lock()
 		repl := state.replications[packfileID]
 		repl.RetryCount = 0 // Reset retry count for fresh backoff
-		state.mu.Unlock()
+		repl.Status = ReplicationStatusPending // Mark for retry
 
-		pkgLogger.Info("packfile: reconciliation retry",
+		pkgLogger.Info("packfile: reconciliation retry marked",
 			"packfile_id", packfileID)
 
-		// Note: In a full implementation, we would retrieve the paths from KV
-		// and call replicatePackfileToS3 again
+		// Note: Actual retry requires packfile paths from KV - the caller of
+		// StartReplication stores paths only in the goroutine's closure.
+		// A full implementation would look up paths from KV and spawn a retry goroutine.
 	}
+	state.mu.Unlock()
 }
 
 // GetAllReplicationStatuses returns all replication statuses (for testing/admin)
