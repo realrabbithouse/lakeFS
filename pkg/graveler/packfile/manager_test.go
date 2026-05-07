@@ -2,6 +2,9 @@ package packfile
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -86,6 +89,60 @@ func (m *mockStoreManager) UpdateSnapshotWithRetry(ctx context.Context, repoID g
 	return nil
 }
 
+func (m *mockStoreManager) ScanPackfiles(ctx context.Context, repoID graveler.RepositoryID, after string, limit int) (PackfilesIterator, error) {
+	return &mockPackfilesIterator{packfiles: m.packfiles, repoID: string(repoID), after: after, limit: limit}, nil
+}
+
+// mockPackfilesIterator is a simple iterator for testing.
+type mockPackfilesIterator struct {
+	packfiles map[string]*PackfileMetadata
+	repoID    string
+	after     string
+	limit     int
+	index     int
+	keys      []string
+	current   *PackfileMetadata
+}
+
+func (m *mockPackfilesIterator) Next() bool {
+	if m.keys == nil {
+		// Build sorted keys on first call
+		for k := range m.packfiles {
+			if strings.HasPrefix(k, m.repoID+"/") {
+				m.keys = append(m.keys, k)
+			}
+		}
+		sort.Strings(m.keys)
+		// Skip past 'after'
+		if m.after != "" {
+			for i, k := range m.keys {
+				if strings.Contains(k, m.after) {
+					m.keys = m.keys[i+1:]
+					break
+				}
+			}
+		}
+	}
+	if m.index >= len(m.keys) || m.index >= m.limit {
+		return false
+	}
+	key := m.keys[m.index]
+	m.current = m.packfiles[key]
+	m.index++
+	return true
+}
+
+func (m *mockPackfilesIterator) Value() *PackfileMetadata {
+	return m.current
+}
+
+func (m *mockPackfilesIterator) Err() error {
+	return nil
+}
+
+func (m *mockPackfilesIterator) Close() {
+}
+
 // mockKVStoreManager is a minimal kv.Store implementation for testing
 type mockKVStoreManager struct{}
 
@@ -136,6 +193,9 @@ func (w *managerStoreAdapter) DeletePackfile(ctx context.Context, repoID gravele
 func (w *managerStoreAdapter) UpdateSnapshotWithRetry(ctx context.Context, repoID graveler.RepositoryID, updateFn func(*PackfileSnapshot) error) error {
 	return w.mock.UpdateSnapshotWithRetry(ctx, repoID, updateFn)
 }
+func (w *managerStoreAdapter) ScanPackfiles(ctx context.Context, repoID graveler.RepositoryID, after string, limit int) (PackfilesIterator, error) {
+	return w.mock.ScanPackfiles(ctx, repoID, after, limit)
+}
 
 func TestNewPackfileManager(t *testing.T) {
 	mock := newMockStoreManager()
@@ -175,17 +235,70 @@ func TestManagerGetPackfileNotFound(t *testing.T) {
 	assert.ErrorIs(t, err, ErrPackfileNotFound)
 }
 
-func TestManagerListPackfiles(t *testing.T) {
+func TestManagerListPackfilesSuccess(t *testing.T) {
+	mock := newMockStoreManager()
+	mock.packfiles["repo1/pf1"] = &PackfileMetadata{
+		PackfileId:   "pf1",
+		RepositoryId: "repo1",
+		Status:       PackfileStatus_STAGED,
+	}
+	mock.packfiles["repo1/pf2"] = &PackfileMetadata{
+		PackfileId:   "pf2",
+		RepositoryId: "repo1",
+		Status:       PackfileStatus_COMMITTED,
+	}
+
+	manager := NewPackfileManager(PackfileManagerConfig{
+		Store:   &managerStoreAdapter{mock: mock},
+	})
+
+	ctx := context.Background()
+	result, err := manager.ListPackfiles(ctx, graveler.RepositoryID("repo1"), "", 10)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Len(t, result.Packfiles, 2)
+	assert.False(t, result.HasMore)
+}
+
+func TestManagerListPackfilesPagination(t *testing.T) {
+	mock := newMockStoreManager()
+	// Add 3 packfiles
+	for i := 1; i <= 3; i++ {
+		pfid := fmt.Sprintf("pf%d", i)
+		mock.packfiles["repo1/"+pfid] = &PackfileMetadata{
+			PackfileId:   pfid,
+			RepositoryId: "repo1",
+			Status:       PackfileStatus_STAGED,
+		}
+	}
+
+	manager := NewPackfileManager(PackfileManagerConfig{
+		Store:   &managerStoreAdapter{mock: mock},
+	})
+
+	ctx := context.Background()
+
+	// Request limit=2 should return has_more=true
+	result, err := manager.ListPackfiles(ctx, graveler.RepositoryID("repo1"), "", 2)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Len(t, result.Packfiles, 2)
+	assert.True(t, result.HasMore)
+	assert.NotEmpty(t, result.NextOffset)
+}
+
+func TestManagerListPackfilesEmpty(t *testing.T) {
 	mock := newMockStoreManager()
 	manager := NewPackfileManager(PackfileManagerConfig{
 		Store:   &managerStoreAdapter{mock: mock},
 	})
 
 	ctx := context.Background()
-	packfiles, hasMore, err := manager.ListPackfiles(ctx, graveler.RepositoryID("repo1"), "", 10)
+	result, err := manager.ListPackfiles(ctx, graveler.RepositoryID("repo1"), "", 10)
 	require.NoError(t, err)
-	assert.Empty(t, packfiles)
-	assert.False(t, hasMore)
+	require.NotNil(t, result)
+	assert.Empty(t, result.Packfiles)
+	assert.False(t, result.HasMore)
 }
 
 func TestManagerGetSnapshot(t *testing.T) {
@@ -296,7 +409,7 @@ func TestManagerContextPropagation(t *testing.T) {
 
 	// These should compile - proving context propagation
 	_, _ = manager.GetPackfile(ctx, graveler.RepositoryID("r"), "p")
-	_, _, _ = manager.ListPackfiles(ctx, graveler.RepositoryID("r"), "", 10)
+	_, _ = manager.ListPackfiles(ctx, graveler.RepositoryID("r"), "", 10)
 	_, _ = manager.GetSnapshot(ctx, graveler.RepositoryID("r"))
 	_, _ = manager.CreateUploadSession(ctx, graveler.RepositoryID("r"), "u", "/tmp")
 	_ = manager.CompleteUploadSession(ctx, "u")

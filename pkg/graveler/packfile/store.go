@@ -1,6 +1,7 @@
 package packfile
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"google.golang.org/protobuf/proto"
 )
 
 // Partition names for KV store
@@ -60,6 +62,15 @@ type StoreInterface interface {
 	PutUploadSession(ctx context.Context, uploadID string, session *UploadSession) error
 	DeleteUploadSession(ctx context.Context, uploadID string) error
 	UpdateSnapshotWithRetry(ctx context.Context, repoID graveler.RepositoryID, updateFn func(*PackfileSnapshot) error) error
+	ScanPackfiles(ctx context.Context, repoID graveler.RepositoryID, after string, limit int) (PackfilesIterator, error)
+}
+
+// PackfilesIterator iterates over packfile metadata entries.
+type PackfilesIterator interface {
+	Next() bool
+	Value() *PackfileMetadata
+	Err() error
+	Close()
 }
 
 // StoreConfig holds configuration for Store.
@@ -279,4 +290,82 @@ func (s *Store) UpdateSnapshotWithRetry(ctx context.Context, repoID graveler.Rep
 		return err
 	}
 	return fmt.Errorf("packfile: snapshot update failed after 3 retries (concurrent modification)")
+}
+
+// packfilesIterator wraps kv.EntriesIterator to decode packfile entries.
+type packfilesIterator struct {
+	iter    kv.EntriesIterator
+	repoID  string
+	current *PackfileMetadata
+}
+
+// Decode packfile entry value into PackfileMetadata protobuf.
+func decodePackfileEntry(value []byte) (*PackfileMetadata, error) {
+	var meta PackfileMetadata
+	if err := proto.Unmarshal(value, &meta); err != nil {
+		return nil, fmt.Errorf("packfile: unmarshaling packfile metadata: %w", err)
+	}
+	return &meta, nil
+}
+
+func (p *packfilesIterator) Next() bool {
+	for p.iter.Next() {
+		entry := p.iter.Entry()
+		if entry == nil {
+			continue
+		}
+		// Skip entries that don't match our prefix
+		expectedPrefix := fmt.Sprintf("packfile:%s:", p.repoID)
+		if !bytes.HasPrefix(entry.Key, []byte(expectedPrefix)) {
+			continue
+		}
+		meta, err := decodePackfileEntry(entry.Value)
+		if err != nil {
+			p.current = nil
+			continue
+		}
+		p.current = meta
+		return true
+	}
+	p.current = nil
+	return false
+}
+
+func (p *packfilesIterator) Value() *PackfileMetadata {
+	return p.current
+}
+
+func (p *packfilesIterator) Err() error {
+	return p.iter.Err()
+}
+
+func (p *packfilesIterator) Close() {
+	p.iter.Close()
+}
+
+// ScanPackfiles returns an iterator over all packfiles for a repository.
+func (s *Store) ScanPackfiles(ctx context.Context, repoID graveler.RepositoryID, after string, limit int) (PackfilesIterator, error) {
+	prefix := fmt.Sprintf("packfile:%s:", repoID)
+	prefixBytes := []byte(prefix)
+
+	var startKey []byte
+	if after != "" {
+		// after is the packfile_id, construct the full key
+		startKey = []byte(fmt.Sprintf("%s%s", prefix, after))
+	} else {
+		startKey = prefixBytes
+	}
+
+	iter, err := s.kvStore.Scan(ctx, []byte(PackfilesPartition), kv.ScanOptions{
+		KeyStart:  startKey,
+		BatchSize: limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("packfile: scanning packfiles: %w", err)
+	}
+
+	return &packfilesIterator{
+		iter:   iter,
+		repoID: string(repoID),
+	}, nil
 }
