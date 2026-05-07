@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package packfile;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/treeverse/lakefs/pkg/graveler/packfile";
+
+// PackfileStatus enum - lifecycle state of a packfile
+enum PackfileStatus {
+  STAGED = 0;       // Created by upload, not yet committed
+  COMMITTED = 1;    // Part of a commit, first-class protection
+  SUPERSEDED = 2;   // Replaced by a merged packfile, eligible for GC
+  DELETED = 3;      // Data removed, metadata to be purged
+}
+
+// PackfileClassification enum - importance level affecting deletion behavior
+enum PackfileClassification {
+  SECOND_CLASS = 0; // Default for STAGED and merged packfiles
+  FIRST_CLASS = 1;  // COMMITTED client-uploaded packfiles, never deleted during merge
+}
+
+// PackfileMetadata represents the metadata for a packfile stored in KV.
+message PackfileMetadata {
+  string packfile_id = 1;           // Bare hex SHA-256 — content-addressed identity
+  PackfileStatus status = 2;
+  PackfileClassification classification = 3;
+  string repository_id = 4;
+  string storage_namespace = 5;     // For constructing full path to packfile
+  int64 object_count = 6;
+  int64 size_bytes = 7;            // Uncompressed total size
+  int64 size_bytes_compressed = 8;
+  string compression_algorithm = 9; // "zstd" | "gzip" | "none"
+  string checksum_algorithm = 10;   // "sha256" | "blake3" | "xxhash"
+  google.protobuf.Timestamp created_at = 11;
+  repeated string source_packfile_ids = 12; // Only set for merged packfiles
+}
+
+// PackfileSnapshot represents the current state of all packfiles for a repository.
+// Updated atomically on commit and merge.
+message PackfileSnapshot {
+  string repository_id = 1;
+  repeated string active_packfile_ids = 2;   // COMMITTED packfiles containing the current committed object set
+  repeated string staged_packfile_ids = 3;   // STAGED packfiles created but not yet committed
+  google.protobuf.Timestamp last_commit_at = 4;
+  google.protobuf.Timestamp last_merge_at = 5;
+  uint64 version = 6; // Optimistic concurrency version
+}
+
+// UploadSession represents an active upload session for tmp/ file lifecycle management.
+message UploadSession {
+  string upload_id = 1;              // ULID — session token
+  string packfile_id = 2;            // Bare hex SHA-256 of the packfile
+  string repository_id = 3;
+  string tmp_path = 4;               // Path to tmp/ staging directory
+  google.protobuf.Timestamp created_at = 5;
+  // status not stored separately — absence of record = abandoned
+}
