@@ -91,12 +91,13 @@ func getReplicationState() *replicationState {
 
 // backoffDuration calculates exponential backoff interval
 func backoffDuration(retryCount uint8, baseInterval time.Duration, maxInterval time.Duration) time.Duration {
-	// Limit retry count to prevent overflow - max backoff is 2^63 which far exceeds any practical interval
+	// Cap shift at 63 to prevent int overflow when computing 1<<shift
 	shift := retryCount
 	if shift > 63 {
 		shift = 63
 	}
-	interval := baseInterval * time.Duration(1<<shift) // 1s, 2s, 4s, 8s, ...
+	// Use uint64 to avoid signed overflow at shift 63
+	interval := baseInterval * time.Duration(uint64(1) << shift) // 1s, 2s, 4s, 8s, ...
 	if interval > maxInterval {
 		interval = maxInterval
 	}
@@ -213,7 +214,7 @@ func replicatePackfileToS3(ctx context.Context, packfileID PackfileID, packfileP
 	defer indexReader.Close()
 
 	// Retry loop with exponential backoff
-	for retryCount := uint8(0); retryCount <= config.MaxRetries; retryCount++ {
+	for retryCount := uint8(0); retryCount < config.MaxRetries; retryCount++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -247,7 +248,7 @@ func replicatePackfileToS3(ctx context.Context, packfileID PackfileID, packfileP
 			"error", err.Error())
 
 		// If not last retry, sleep with backoff
-		if retryCount < config.MaxRetries {
+		if retryCount < config.MaxRetries-1 {
 			backoff := backoffDuration(retryCount, config.BaseInterval, config.MaxInterval)
 			pkgLogger.Info("packfile: replication backing off",
 				"packfile_id", packfileID,
@@ -360,6 +361,12 @@ func updateReplicationError(state *replicationState, packfileID PackfileID, err 
 // StartReconciliationLoop starts the background loop that retries FAILED replications
 // Returns a stop function to call during shutdown
 func StartReconciliationLoop(ctx context.Context, interval time.Duration) func() {
+	// Validate interval to prevent ticker panic
+	if interval <= 0 {
+		interval = 1 * time.Second
+	}
+
+	state := getReplicationState()
 	// Use a fresh stop channel per reconciliation loop to avoid interference between loops
 	stopCh := make(chan struct{})
 
@@ -376,11 +383,16 @@ func StartReconciliationLoop(ctx context.Context, interval time.Duration) func()
 			case <-ctx.Done():
 				pkgLogger.Info("packfile: reconciliation loop stopped (context cancelled)")
 				return
+			case <-state.stopCh:
+				// Global stop - stop all reconciliation loops
+				pkgLogger.Info("packfile: reconciliation loop stopped (global stop)")
+				return
 			case <-stopCh:
+				// Local stop - stop this specific loop
 				pkgLogger.Info("packfile: reconciliation loop stopped")
 				return
 			case <-ticker.C:
-				reconcileFailedReplications(ctx)
+				reconcileFailedReplications()
 			}
 		}
 	}()
@@ -391,7 +403,7 @@ func StartReconciliationLoop(ctx context.Context, interval time.Duration) func()
 }
 
 // reconcileFailedReplications retries all FAILED replications
-func reconcileFailedReplications(ctx context.Context) {
+func reconcileFailedReplications() {
 	state := getReplicationState()
 
 	state.mu.Lock()
